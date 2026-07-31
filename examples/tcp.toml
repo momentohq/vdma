@@ -1,0 +1,43 @@
+## ===========================================================================
+##  valkey-dma — module configuration  ·  TCP fabric
+##
+##  Profile for local testing on localhost.
+##  RESP commands (DMA.SET / DMA.GET) always travel over TCP via redis-rs;
+##  the libfabric fabric below is what moves value payloads.
+## ===========================================================================
+
+
+## ---------------------------------------------------------------------------
+##  [dma-libfabric] — libfabric data-payload transport
+## ---------------------------------------------------------------------------
+[dma-libfabric]
+
+# Providers to attempt, in preference order.
+#   values:  "tcp" | "efa-direct"
+#   default: ["tcp"]
+providers = ["tcp"]
+
+# Interfaces (NICs) to use for payload DMA.
+#   empty  = use every interface discovered on the configured hardware
+#   pin a specific NIC by name, e.g. the loopback for localhost:
+#   interfaces = ["lo"]
+interfaces = []
+
+# Source address to bind the server's fabric endpoint. It must be able to reach the
+# addresses clients advertise on each request; for localhost testing pin the loopback.
+#   default: provider chooses
+bind = "127.0.0.1"
+
+
+## ---------------------------------------------------------------------------
+##  [observability.console-host] — live tracing console  ·  ENABLED
+##
+##  The presence of this section turns the tracing console host ON. Remove it
+##  to disable: tracing then stays filtered OFF, for zero hot-path cost.
+##  Point a console client at `listen` to stream spans live.
+## ---------------------------------------------------------------------------
+[observability.console-host]
+
+# Address the console host binds for console clients.
+#   default: "127.0.0.1:7777"
+listen = "127.0.0.1:7777"

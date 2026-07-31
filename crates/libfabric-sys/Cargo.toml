@@ -1,0 +1,15 @@
+[package]
+name = "libfabric-sys"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+links = "fabric"
+
+# Raw FFI bindings to libfabric (OFI). The safe wrapper lives in `dma-libfabric`.
+# Generated bindings intentionally skip the workspace lints.
+
+[build-dependencies]
+bindgen              = { version = "0.72", features = ["experimental"] }
+cc                   = { version = "1" }
+pkg-config           = { version = "0.3" }

@@ -1,0 +1,15 @@
+[package]
+name = "dma-libfabric"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+dma-traits           = { workspace = true }
+libfabric-sys        = { workspace = true }
+serde                = { workspace = true }
+tracing              = { workspace = true }
+
+[lints]
+workspace = true

@@ -1,0 +1,46 @@
+## ===========================================================================
+##  valkey-dma — module configuration  ·  EFA fabric
+##
+##  Profile for testing across AWS instances with Elastic Fabric Adapter.
+##  RESP commands (DMA.SET / DMA.GET) always travel over TCP via redis-rs;
+##  the libfabric fabric below is what moves value payloads — over EFA.
+## ===========================================================================
+
+
+## ---------------------------------------------------------------------------
+##  [dma-libfabric] — libfabric data-payload transport
+## ---------------------------------------------------------------------------
+[dma-libfabric]
+
+# Providers to attempt, in preference order.
+#   values:  "tcp" | "efa-direct"
+#   default: ["tcp"]
+# "efa-direct" — EFA's hardware-RDMA fabric: device RMA, no wire protocol, no host progress. Single
+#                op up to the device's 1 GiB RDMA limit (> valkey's 512 MB key cap, so no
+#                segmentation). A client may expose GPU memory to it; the server needs no HMEM caps
+#                to RMA against a remote region, so there is nothing to configure here for that.
+providers = ["efa-direct"]
+
+# Interfaces (NICs) to use for payload DMA.
+#   empty  = use every interface discovered on the configured hardware
+#   pin a specific EFA device by name, e.g.:
+#   interfaces = ["rdmap16s27"]
+interfaces = []
+
+# Leave `bind` UNSET for EFA: the endpoint binds to the EFA device and advertises its own fabric
+# address (not an IP). Server and clients must be EFA-RDMA instances in the same cluster placement
+# group / security group. (Pinning an IP here is a tcp-only convenience.)
+
+
+## ---------------------------------------------------------------------------
+##  [observability.console-host] — live tracing console  ·  ENABLED
+##
+##  The presence of this section turns the tracing console host ON. Remove it
+##  to disable: tracing then stays filtered OFF, for zero hot-path cost.
+##  Binds on all interfaces so a console client can reach the AWS instance.
+## ---------------------------------------------------------------------------
+[observability.console-host]
+
+# Address the console host binds for console clients.
+#   default: "127.0.0.1:7777"
+listen = "0.0.0.0:7777"
