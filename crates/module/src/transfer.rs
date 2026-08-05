@@ -10,10 +10,9 @@
 //!   no-copy `StringSet` only once the optional CRC checks out, so the keyspace never sees a
 //!   half-written or corrupt value.
 
-use std::collections::HashMap;
 use std::ptr;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, LazyLock, Mutex, OnceLock, PoisonError};
+use std::sync::{Arc, OnceLock};
 
 use dma_libfabric::{
     Completion, Configuration as FabricConfiguration, Direction, FabricServer, Outcome, Pool,
@@ -98,15 +97,12 @@ impl HeldValue {
 /// Only valkey's single command thread starts these, so the lazy init cannot race.
 static FABRIC_SERVERS: OnceLock<Vec<FabricServer<OpToken>>> = OnceLock::new();
 
-/// Sticky client-to-device assignment, pinning a connection to one worker for its life. efa-direct
-/// requires it: the client inserts that worker's address into its address vector via `dma.hello`, so
-/// every command from it must reach the same device. New clients round-robin via `NEXT`.
-static ASSIGNMENTS: LazyLock<Mutex<HashMap<u64, usize>>> =
-    LazyLock::new(|| Mutex::new(HashMap::new()));
+/// Rotates between equally loaded devices, so a burst of same-depth choices spreads instead of
+/// stacking on the lowest index.
 static NEXT: AtomicUsize = AtomicUsize::new(0);
 
-/// Start one worker per discovered EFA device for round-robin balancing, or a single worker for
-/// other providers and when discovery finds nothing.
+/// Start one worker per discovered EFA device, or a single worker for other providers and when
+/// discovery finds nothing. Every worker is a candidate for every transfer.
 fn start_servers(
     context: &Context,
     fabric: &FabricConfiguration,
@@ -139,7 +135,7 @@ fn start_servers(
         context,
         &format!(
             "valkey-dma: discovered {} EFA device(s) {domains:?}; starting one worker per device, \
-             round-robining new sessions across them",
+             advertising all of them and serving each transfer on the least loaded",
             domains.len()
         ),
     );
@@ -169,17 +165,20 @@ fn fabric_servers(context: &Context) -> Result<&'static [FabricServer<OpToken>],
         .ok_or_else(|| DmaError::Fabric("fabric servers unavailable".into()))
 }
 
-/// The worker assigned to `client_id`, assigning round-robin on first sight.
-fn fabric_server_for(
-    context: &Context,
-    client_id: u64,
-) -> Result<&'static FabricServer<OpToken>, DmaError> {
+/// The device with the least work outstanding, chosen per operation. Every worker's address is
+/// advertised by `dma.hello`, so any of them may initiate against a client and none is pinned to one.
+/// Ties rotate through `NEXT`, which matters at low load where every device reads zero.
+fn least_loaded_server(context: &Context) -> Result<&'static FabricServer<OpToken>, DmaError> {
     let servers = fabric_servers(context)?;
-    let mut assignments = ASSIGNMENTS.lock().unwrap_or_else(PoisonError::into_inner);
-    let index = *assignments
-        .entry(client_id)
-        .or_insert_with(|| NEXT.fetch_add(1, Ordering::Relaxed) % servers.len());
-    Ok(&servers[index])
+    let rotation = NEXT.fetch_add(1, Ordering::Relaxed);
+    servers
+        .iter()
+        .enumerate()
+        // Rotating the index before comparing makes the tie-break fall on a different device each
+        // call, since `min_by_key` keeps the first of equal keys.
+        .min_by_key(|(index, server)| (server.outstanding(), (index + rotation) % servers.len()))
+        .map(|(_, server)| server)
+        .ok_or_else(|| DmaError::Fabric("no fabric workers".into()))
 }
 
 /// Release a disconnecting client's fabric state, so its address-vector entry doesn't linger for the
@@ -193,30 +192,31 @@ fn on_client_change(context: &Context, subevent: ClientChangeSubevent) {
     }
 }
 
-/// Drop a client's device assignment and ask its worker to remove its address-vector entry, which
-/// the worker defers until the client's in-flight ops drain. A no-op for a client that never issued
-/// a transfer.
+/// Ask every worker to remove the disconnecting client's address-vector entry, which each defers
+/// until that client's in-flight ops on it drain. Any device may have served this client, so all are
+/// told; a worker that never saw it does nothing.
 fn release_client(client_id: u64) {
-    let assigned = {
-        let mut assignments = ASSIGNMENTS.lock().unwrap_or_else(PoisonError::into_inner);
-        assignments.remove(&client_id)
+    let Some(servers) = FABRIC_SERVERS.get() else {
+        return;
     };
-    if let Some(index) = assigned
-        && let Some(server) = FABRIC_SERVERS.get().and_then(|servers| servers.get(index))
-    {
+    for server in servers {
         server.remove_peer(client_id);
     }
 }
 
-/// `DMA.HELLO`: the hex fabric address of the worker assigned to this client. The client inserts it
-/// into its own address vector before issuing a transfer, so the server can RMA against it on
-/// efa-direct, where the target must already hold the initiator's address. The assignment is sticky,
-/// so this is the same device the client's transfers will use. Starts the workers if they aren't up.
+/// `DMA.HELLO`: the hex fabric address of every worker, in device order. These are the source
+/// addresses the server may initiate from, and the client inserts all of them into its own address
+/// vector before issuing a transfer — efa-direct requires the target to already hold the initiator's
+/// address, and which device serves a given operation is chosen per operation. Starts the workers if
+/// they aren't up.
 pub fn dma_hello(context: &Context) -> ValkeyResult {
-    let server = fabric_server_for(context, context.get_client_id()).map_err(command_error)?;
-    Ok(ValkeyValue::SimpleString(encode_hex(
-        server.local_address(),
-    )))
+    let servers = fabric_servers(context).map_err(command_error)?;
+    Ok(ValkeyValue::Array(
+        servers
+            .iter()
+            .map(|server| ValkeyValue::SimpleString(encode_hex(server.local_address())))
+            .collect(),
+    ))
 }
 
 /// Finish a batch of completed transfers.
@@ -410,7 +410,7 @@ pub fn dma_get(
     // Block the client, build the request, hand it to the fabric worker.
     let _submit = tracing::info_span!("submit").entered();
     let client_id = context.get_client_id();
-    let server = match fabric_server_for(context, client_id) {
+    let server = match least_loaded_server(context) {
         Ok(server) => server,
         Err(error) => return Err(command_error(error)),
     };
@@ -454,7 +454,7 @@ pub fn dma_set(
 
     let _submit = tracing::info_span!("submit").entered();
     let client_id = context.get_client_id();
-    let server = match fabric_server_for(context, client_id) {
+    let server = match least_loaded_server(context) {
         Ok(server) => server,
         Err(error) => return Err(command_error(error)),
     };

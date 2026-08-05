@@ -10,6 +10,8 @@ use std::sync::Arc;
 use std::sync::mpsc::Sender;
 use std::sync::mpsc::{Receiver, TryRecvError};
 
+use std::sync::atomic::{AtomicUsize, Ordering};
+
 use crate::BatchCompleter;
 use crate::Completion;
 use crate::Configuration;
@@ -39,6 +41,7 @@ pub fn worker_main<T: DestinationAllocator + Send + 'static>(
     receiver: &Receiver<WorkerMessage<T>>,
     complete_batch: Arc<BatchCompleter<T>>,
     pool: Arc<Pool>,
+    outstanding: &AtomicUsize,
 ) {
     // The endpoint's fabric address doubles as the readiness signal — clients insert it via
     // dma.hello so the server can RMA against them on efa-direct.
@@ -125,6 +128,7 @@ pub fn worker_main<T: DestinationAllocator + Send + 'static>(
                         &mut peers,
                         &mut outstanding_by_client,
                         &mut pending_removal,
+                        outstanding,
                         client_id,
                     );
                 }
@@ -136,6 +140,7 @@ pub fn worker_main<T: DestinationAllocator + Send + 'static>(
                         &mut peers,
                         &mut outstanding_by_client,
                         &mut pending_removal,
+                        outstanding,
                         client_id,
                     );
                 }
@@ -173,6 +178,7 @@ pub fn worker_main<T: DestinationAllocator + Send + 'static>(
                 &mut peers,
                 &mut outstanding_by_client,
                 &mut pending_removal,
+                outstanding,
                 inflight.client_id,
             );
             // Checksummed ops carry their CRC into the completion, so defer the whole completion to
@@ -299,8 +305,14 @@ fn finish_op(
     peers: &mut HashMap<u64, CachedPeer>,
     outstanding_by_client: &mut HashMap<u64, usize>,
     pending_removal: &mut HashSet<u64>,
+    outstanding: &AtomicUsize,
     client_id: u64,
 ) {
+    // The device-wide counter `submit` raised. Saturating for the same reason the in-flight tally is:
+    // a stray extra finish must not wrap it and make this device look infinitely loaded forever.
+    let _ = outstanding.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+        Some(current.saturating_sub(1))
+    });
     let remaining = match outstanding_by_client.get_mut(&client_id) {
         Some(count) => {
             *count -= 1;

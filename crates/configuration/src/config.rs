@@ -7,6 +7,7 @@ pub use dma_libfabric::Configuration as DmaLibfabricConfiguration;
 
 /// Module configuration root.
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct Configuration {
     /// `[dma-libfabric]`.
     #[serde(default, rename = "dma-libfabric")]
@@ -43,6 +44,30 @@ mod tests {
         let configuration = Configuration::from_toml("").expect("defaults parse");
         assert_eq!(configuration, Configuration::default());
         assert_eq!(configuration.dma_libfabric.providers, vec![Provider::Tcp]);
+    }
+
+    /// A misspelled or retired key must fail the load rather than be dropped. Silently ignoring one
+    /// costs a debugging session: the operator sets a knob, sees no effect, and blames the code.
+    #[test]
+    fn rejects_unknown_keys() {
+        // A retired key, at the section level.
+        let error = Configuration::from_toml("[dma-libfabric]\ndirection = \"bidirectional\"\n")
+            .expect_err("retired key rejected");
+        assert!(
+            error.to_string().contains("direction"),
+            "error should name the offending key, got: {error}"
+        );
+        // A hyphenated spelling of a snake_case key.
+        assert!(
+            Configuration::from_toml("[dma-libfabric]\ncrc-pool-threads = 8\n").is_err(),
+            "hyphenated spelling of crc_pool_threads should be rejected"
+        );
+        // And at the root and the nested observability section.
+        assert!(Configuration::from_toml("nonsense = 1\n").is_err());
+        assert!(
+            Configuration::from_toml("[observability.console-host]\nlisten_addr = \"1.2.3.4:1\"\n")
+                .is_err()
+        );
     }
 
     #[test]

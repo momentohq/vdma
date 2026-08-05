@@ -41,6 +41,7 @@ impl Provider {
 
 /// Local configuration section for the libfabric DMA layer.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct Configuration {
     /// Providers to attempt, in preference order.
     #[serde(default = "default_providers")]

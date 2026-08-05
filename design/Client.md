@@ -49,15 +49,14 @@ be non-uniform affinity between some EFA cards and some GpuDirect targets. Those
 details are beyond generalizations, but generally if they're in scope for a client
 then they need to be considered as part of a client's implementation.
 
-While vdma uses a connectionless protocol, it is nevertheless connection-oriented.
-One Valkey RESP connection (via a `DMA.HELLO`) is bound to one server EFA. Today,
-even passive client EFA's require their remote's address to be registered - so
-a vdma.EFA maps to a client.EFA per Valkey connection. When the Valkey connection
-is dropped, clear the related client EFA state (the vdma server will do so as well).
+`DMA.HELLO` returns every address the server may initiate from. A passive
+client EFA requires its remote's address to be registered, so insert all of them into your
+address vector before the first RMA — any of them may serve a given transfer, and which one
+does is the server's choice, made per operation. When the Valkey connection is dropped,
+clear the related client EFA state (the vdma server clears its side as well).
 
-If you have many interfaces and you want them all to stream, you need a Valkey
-connection per local EFA interface. That connection serves as the control channel
-for the DMA rpcs.
+The client keeps the reciprocal choice of which local interface exposes the buffer it
+advertises.
 
 # Device support
 GpuDirect is a fantastic low-overhead way to get data from Valkey into a gpu. This

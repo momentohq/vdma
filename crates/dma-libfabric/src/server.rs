@@ -10,7 +10,7 @@
 //! finishes under one lock acquisition rather than one per op.
 
 use std::sync::Arc;
-use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{Sender, channel};
 use std::thread::JoinHandle;
 
@@ -108,6 +108,10 @@ pub struct FabricServer<TContext: Send + 'static> {
     /// hold the initiator's address, so a client inserts this into its own address vector before the
     /// server RMAs against it, learning it via [`Self::local_address`] in the `dma.hello` exchange.
     address: Vec<u8>,
+    /// Submitted but not yet finished, counting queued ops as well as posted ones so the depth of
+    /// this device's backlog is visible to a caller balancing across devices. Shared with the worker,
+    /// which decrements as each op finishes.
+    outstanding: Arc<AtomicUsize>,
 }
 
 impl<TContext: Send + 'static> std::fmt::Debug for FabricServer<TContext> {
@@ -136,6 +140,8 @@ impl<TContext: Send + 'static> FabricServer<TContext> {
         let configuration = configuration.clone();
         // Shared with the pool jobs finishing checksummed transfers off the worker thread.
         let complete_batch = Arc::new(complete_batch);
+        let outstanding = Arc::new(AtomicUsize::new(0));
+        let worker_outstanding = Arc::clone(&outstanding);
 
         static INDEX: AtomicUsize = AtomicUsize::new(0);
         let handle = std::thread::Builder::new()
@@ -150,6 +156,7 @@ impl<TContext: Send + 'static> FabricServer<TContext> {
                     &receiver,
                     complete_batch,
                     pool,
+                    &worker_outstanding,
                 )
             })
             .map_err(|error| DmaError::Fabric(format!("failed to spawn fabric worker: {error}")))?;
@@ -158,6 +165,7 @@ impl<TContext: Send + 'static> FabricServer<TContext> {
                 sender: Some(sender),
                 dma_worker_handle: Some(handle),
                 address,
+                outstanding,
             }),
             Ok(Err(error)) => {
                 let _ = handle.join();
@@ -176,23 +184,31 @@ impl<TContext: Send + 'static> FabricServer<TContext> {
         &self.address
     }
 
+    /// Transfers submitted here but not yet finished, queued and posted alike. The load signal a
+    /// caller balances on: it rises the moment work is handed over, not when it reaches the wire.
+    pub fn outstanding(&self) -> usize {
+        self.outstanding.load(Ordering::Relaxed)
+    }
+
     /// Submit a transfer, whose completion is handed back in a batch when it finishes. If the worker
     /// is gone the request comes back, so the caller can fail the client.
     pub fn submit(
         &self,
         request: TransferRequest<TContext>,
     ) -> Result<(), TransferRequest<TContext>> {
-        match self.sender.as_ref() {
-            Some(sender) => sender
-                .send(WorkerMessage::Transfer(request))
-                .map_err(|error| {
-                    let WorkerMessage::Transfer(request) = error.0 else {
-                        unreachable!("sent a Transfer");
-                    };
-                    request
-                }),
-            None => Err(request),
-        }
+        let Some(sender) = self.sender.as_ref() else {
+            return Err(request);
+        };
+        self.outstanding.fetch_add(1, Ordering::Relaxed);
+        sender
+            .send(WorkerMessage::Transfer(request))
+            .map_err(|error| {
+                self.outstanding.fetch_sub(1, Ordering::Relaxed);
+                let WorkerMessage::Transfer(request) = error.0 else {
+                    unreachable!("sent a Transfer");
+                };
+                request
+            })
     }
 
     /// Ask the worker to drop a disconnected client's address-vector entry once its in-flight

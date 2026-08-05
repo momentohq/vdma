@@ -34,18 +34,21 @@ https://github.com/valkey-io/valkey/pull/4050
 
 # Communication model
 ![vdma design](vdma.png)
-A worker thread per EFA manages libfabric resources. 1 client binds to 1 EFA thread.
-If you want to have N EFA's worth of throughput, you bind N clients. EFA requires the
-remote's address on the receiving side, so designing without affinity penalizes
-performance multiple times.
+A worker thread per EFA manages libfabric resources. EFA requires the remote's address on
+the receiving side, so the server advertises every worker's address up front and the client
+holds them all. That lets the server pick a worker per transfer — the least loaded one —
+rather than pinning a client to a device and inheriting whatever imbalance the assignment
+happened to produce. A client that wants N EFA's worth of throughput on its own side still
+binds N local interfaces; that choice stays with the client.
 
 # RESP: control channel
 Standard RESP initiates and completes every transfer. It carries the client's buffer
 advertisement and the result per RPC. The client advertises memory, and the server uses
 it according to the control channel's instructions.
 
-* `DMA.HELLO`: Server returns (hex) the fabric address of the efa worker assigned to this
-  client. The client inserts it into its address vector before any RMA.
+* `DMA.HELLO`: Server returns an array of (hex) fabric addresses, one per efa worker — the
+  set of source addresses it may initiate from. The client inserts all of them into its
+  address vector before any RMA, since any of them may be the initiator for a given transfer.
 * `DMA.SET <address> <rkey> <remote-address> <length> <key> [<crc>]`: Client advertises
   a registered buffer (endpoint address, remote key, buffer virtual address) with a value.
   Server sizes the ValkeyString and dma-reads the payload straight into it. If requested,
@@ -74,8 +77,9 @@ a single GIL acquisition. When nothing is outstanding it parks on the request ch
 blocking `recv`) to release the thread.
 
 ### Addressing
-The advertised `remote-address` is the client buffer's virtual address. Each client is
-assigned a worker, and the worker `fi_av_remove`s the client buffer address on disconnect.
+The advertised `remote-address` is the client buffer's virtual address. Each worker inserts
+a client's address into its own address vector on first use, and every worker `fi_av_remove`s
+it on disconnect, deferring until that worker's in-flight transfers for the client drain.
 
 ### GPUDirect (optional)
 The client buffer may be GPU device memory exposed via dmabuf (`FI_HMEM` / `FI_MR_DMABUF`).
