@@ -15,21 +15,86 @@
 
 use std::collections::BTreeMap;
 use std::os::raw::{c_char, c_int, c_void};
-use std::sync::Mutex;
+use std::sync::{Mutex, OnceLock};
 
 use libfabric_sys::{fi_close, fid_mr};
 
-// valkey's jemalloc, prefixed `je_`, resolved from the host process at module load.
+/// How a local operand registration is reclaimed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RegionMode {
+    /// jemalloc registrations are cached and the wrapped hooks close them as the pages
+    /// are reclaimed.
+    Cached,
+    /// No jemalloc. Register per operation and close at completion, which costs
+    /// `fi_mr_reg` for every transfer.
+    PerOperation,
+}
+
+static MODE: OnceLock<RegionMode> = OnceLock::new();
+
+/// `PerOperation` until [`install`] finds jemalloc.
+pub(crate) fn mode() -> RegionMode {
+    MODE.get().copied().unwrap_or(RegionMode::PerOperation)
+}
+
 unsafe extern "C" {
-    fn je_mallctl(
-        name: *const c_char,
-        oldp: *mut c_void,
-        oldlenp: *mut usize,
-        newp: *mut c_void,
-        newlen: usize,
-    ) -> c_int;
-    fn je_malloc(size: usize) -> *mut c_void;
-    fn je_free(pointer: *mut c_void);
+    fn dlsym(handle: *mut c_void, symbol: *const c_char) -> *mut c_void;
+}
+
+#[cfg(target_os = "macos")]
+const RTLD_DEFAULT: *mut c_void = -2isize as *mut c_void;
+#[cfg(not(target_os = "macos"))]
+const RTLD_DEFAULT: *mut c_void = std::ptr::null_mut();
+
+type MallctlFn =
+    unsafe extern "C" fn(*const c_char, *mut c_void, *mut usize, *mut c_void, usize) -> c_int;
+type MallocFn = unsafe extern "C" fn(usize) -> *mut c_void;
+type FreeFn = unsafe extern "C" fn(*mut c_void);
+
+/// valkey's jemalloc, prefixed `je_`. Dynamically loaded, so the module still loads against
+/// another allocator like on macos.
+struct Jemalloc {
+    mallctl: MallctlFn,
+    malloc: MallocFn,
+    free: FreeFn,
+}
+
+static JEMALLOC: OnceLock<Option<Jemalloc>> = OnceLock::new();
+
+fn jemalloc() -> Option<&'static Jemalloc> {
+    JEMALLOC
+        .get_or_init(|| {
+            // SAFETY: each symbol is looked up by its own name and transmuted to that function's
+            // signature, taken from jemalloc's public header.
+            unsafe {
+                let mallctl = dlsym(RTLD_DEFAULT, c"je_mallctl".as_ptr());
+                let malloc = dlsym(RTLD_DEFAULT, c"je_malloc".as_ptr());
+                let free = dlsym(RTLD_DEFAULT, c"je_free".as_ptr());
+                if mallctl.is_null() || malloc.is_null() || free.is_null() {
+                    return None;
+                }
+                Some(Jemalloc {
+                    mallctl: std::mem::transmute::<*mut c_void, MallctlFn>(mallctl),
+                    malloc: std::mem::transmute::<*mut c_void, MallocFn>(malloc),
+                    free: std::mem::transmute::<*mut c_void, FreeFn>(free),
+                })
+            }
+        })
+        .as_ref()
+}
+
+/// `je_mallctl`, or a non-zero code when the host has no jemalloc.
+fn mallctl(
+    name: *const c_char,
+    oldp: *mut c_void,
+    oldlenp: *mut usize,
+    newp: *mut c_void,
+    newlen: usize,
+) -> c_int {
+    match jemalloc() {
+        Some(jemalloc) => unsafe { (jemalloc.mallctl)(name, oldp, oldlenp, newp, newlen) },
+        None => -1,
+    }
 }
 
 /// jemalloc 5.3's `extent_hooks_t`: nine function pointers. Layout must match.
@@ -325,6 +390,8 @@ fn reclaim_range(
 /// What [`install`] tuned, for operator logging.
 #[derive(Debug)]
 pub struct RegionHooksReport {
+    /// How operand registrations will be reclaimed.
+    pub mode: RegionMode,
     /// The oversize/"huge" arena index, if oversize routing is on and it was found.
     pub huge_arena: Option<u32>,
     /// Decay window (ms) applied to the huge arena, overriding jemalloc's eager `0`.
@@ -341,16 +408,22 @@ pub struct RegionHooksReport {
 /// huge arena's dirty/muzzy decay window (jemalloc forces it to 0, purging every freed oversize value
 /// at once) and its eager-purge-on-free threshold (jemalloc's 8 MiB purges freed oversize extents
 /// instead of caching them dirty, re-faulting and re-registering the next value).
-pub fn install(
+pub fn install_region_hooks(
     huge_arena_decay_ms: i64,
     huge_arena_oversize_threshold: usize,
-) -> Result<RegionHooksReport, String> {
+) -> RegionHooksReport {
     // Capture arena 0's defaults so the wrappers can chain to real reclaim, and copy the
     // non-overridden fields into WRAPPED so jemalloc's own alloc/commit/split/merge still run.
     // `ensure_arena_hooked` installs WRAPPED, so it must be complete before any registration.
-    let default = read_extent_hooks(0).ok_or_else(|| {
-        "arena.0.extent_hooks unavailable (not the jemalloc allocator?)".to_string()
-    })?;
+    let Some(default) = read_extent_hooks(0) else {
+        let _ = MODE.set(RegionMode::PerOperation);
+        return RegionHooksReport {
+            mode: RegionMode::PerOperation,
+            huge_arena: None,
+            huge_arena_decay_ms,
+            huge_arena_oversize_threshold,
+        };
+    };
     // SAFETY: single-threaded startup, before any wrapped hook is installed.
     unsafe {
         DEFAULT = default;
@@ -363,11 +436,13 @@ pub fn install(
     // Force the huge arena into existence and override its eager decay and eager-purge.
     let huge_arena = tune_huge_arena(huge_arena_decay_ms, huge_arena_oversize_threshold);
 
-    Ok(RegionHooksReport {
+    let _ = MODE.set(RegionMode::Cached);
+    RegionHooksReport {
+        mode: RegionMode::Cached,
         huge_arena,
         huge_arena_decay_ms,
         huge_arena_oversize_threshold,
-    })
+    }
 }
 
 /// Close every region on `domain`, called by an endpoint before closing that domain (regions are
@@ -400,7 +475,8 @@ fn tune_huge_arena(decay_ms: i64, oversize_threshold: usize) -> Option<u32> {
     // Above the 8 MiB default `oversize_threshold`, so this routes to the huge arena, creating it
     // and letting `arenas.lookup` name it.
     const OVERSIZE_NUDGE: usize = 16 * 1024 * 1024;
-    let pointer = unsafe { je_malloc(OVERSIZE_NUDGE) };
+    let jemalloc = jemalloc()?;
+    let pointer = unsafe { (jemalloc.malloc)(OVERSIZE_NUDGE) };
     if pointer.is_null() {
         return None;
     }
@@ -410,7 +486,7 @@ fn tune_huge_arena(decay_ms: i64, oversize_threshold: usize) -> Option<u32> {
         write_isize(&arena_key(index, "muzzy_decay_ms"), decay_ms as isize);
         write_size(&arena_key(index, "oversize_threshold"), oversize_threshold);
     }
-    unsafe { je_free(pointer) };
+    unsafe { (jemalloc.free)(pointer) };
     arena
 }
 
@@ -430,8 +506,8 @@ fn arena_of(pointer: *mut c_void) -> Option<u32> {
     let mut arena_ind: u32 = 0;
     let mut out_size = std::mem::size_of::<u32>();
     let mut lookup = pointer;
-    let code = unsafe {
-        je_mallctl(
+    let code = {
+        mallctl(
             c"arenas.lookup".as_ptr(),
             (&mut arena_ind as *mut u32).cast::<c_void>(),
             &mut out_size,
@@ -443,8 +519,8 @@ fn arena_of(pointer: *mut c_void) -> Option<u32> {
 }
 
 fn write_isize(name: &std::ffi::CStr, mut value: isize) -> bool {
-    let code = unsafe {
-        je_mallctl(
+    let code = {
+        mallctl(
             name.as_ptr(),
             std::ptr::null_mut(),
             std::ptr::null_mut(),
@@ -456,8 +532,8 @@ fn write_isize(name: &std::ffi::CStr, mut value: isize) -> bool {
 }
 
 fn write_size(name: &std::ffi::CStr, mut value: usize) -> bool {
-    let code = unsafe {
-        je_mallctl(
+    let code = {
+        mallctl(
             name.as_ptr(),
             std::ptr::null_mut(),
             std::ptr::null_mut(),
@@ -472,8 +548,8 @@ fn read_extent_hooks(arena: u32) -> Option<ExtentHooks> {
     let name = arena_key(arena, "extent_hooks");
     let mut value: *mut ExtentHooks = std::ptr::null_mut();
     let mut size = std::mem::size_of::<*mut ExtentHooks>();
-    let code = unsafe {
-        je_mallctl(
+    let code = {
+        mallctl(
             name.as_ptr(),
             (&mut value as *mut *mut ExtentHooks).cast::<c_void>(),
             &mut size,
@@ -488,8 +564,8 @@ fn write_extent_hooks(arena: u32) -> bool {
     let name = arena_key(arena, "extent_hooks");
     // SAFETY: WRAPPED is a stable static; jemalloc retains the pointer and calls through it.
     let mut hooks_pointer: *mut ExtentHooks = std::ptr::addr_of_mut!(WRAPPED);
-    let code = unsafe {
-        je_mallctl(
+    let code = {
+        mallctl(
             name.as_ptr(),
             std::ptr::null_mut(),
             std::ptr::null_mut(),

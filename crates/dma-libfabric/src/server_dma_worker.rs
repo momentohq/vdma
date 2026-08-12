@@ -22,6 +22,7 @@ use crate::TransferDone;
 use crate::TransferRequest;
 use crate::endpoint::{LibfabricEndpoint, PeerHandle};
 use crate::error::fabric_error;
+use crate::local_regions::{LocalOperand, OperandRegistration};
 use crate::pool::Pool;
 use crate::server::WorkerMessage;
 
@@ -357,13 +358,14 @@ fn post<T>(
     let peer = peer_handle(endpoint, peers, prepared.client_id, &prepared.peer_address)?;
     let context = prepared.context.cast::<c_void>();
     let length = prepared.buffer.length;
-    // Null for providers needing no local registration; otherwise the containing region's cached
-    // descriptor, registered on first touch.
-    let descriptor = endpoint.local_descriptor(prepared.buffer.pointer, length)?;
+    let LocalOperand {
+        descriptor,
+        registration,
+    } = endpoint.local_operand(prepared.buffer.pointer, length)?;
     let connection = endpoint.connection(peer, prepared.remote_key, prepared.remote_address);
     // On-wire time, as an explicit child of the caller's `dma.get`/`dma.set` span so the transfer
     // tree covers setup -> wire -> completion without entering the parent on this thread. Stored in
-    // the op, so it stays open until completion.
+    // the operation, so it stays open until completion.
     let wire = tracing::info_span!(
         parent: prepared.parent_id.clone(),
         "wire",
@@ -388,13 +390,15 @@ fn post<T>(
         }
     };
     if 0 == code {
-        // Hand both spans to the in-flight op so they live until it is reaped.
+        // Hand both spans to the in-flight operation so they live until it is reaped.
         let await_completion = tracing::info_span!(parent: &wire, "await_completion");
-        // SAFETY: `context` is this op's live `InFlight`, valid until the completion runs, and no
+        // SAFETY: `context` is this operation's live `InFlight`, valid until the completion runs, and no
         //         other thread touches it until then.
         unsafe {
             (*prepared.context).wire_span = wire;
             (*prepared.context).await_span = await_completion;
+            // Held until the completion drops the operation.
+            (*prepared.context).local_registration = registration;
         }
     }
     Ok(code)
@@ -458,6 +462,9 @@ struct InFlight<T> {
     want_checksum: bool,
     /// The local operand: the source for `ToPeer`, the landing buffer for `FromPeer`.
     buffer_pointer: *mut u8,
+    /// The operand's registration under `RegionMode::PerOperation`, closed when this op is reaped
+    /// and its `InFlight` dropped. `None` when the registry owns it.
+    local_registration: Option<OperandRegistration>,
     /// Post to reap: the on-wire duration. `Span::none()` until posted, and when tracing is off.
     wire_span: tracing::Span,
     /// Child of `wire_span` covering only the wait, from `fi_*` returning to the completion reaped.
@@ -524,6 +531,8 @@ fn prepare<T: DestinationAllocator>(mut request: TransferRequest<T>) -> Prepared
         length,
         want_checksum: request.want_checksum,
         buffer_pointer: pointer,
+        // Set at post time, once the operand is registered.
+        local_registration: None,
         wire_span: tracing::Span::none(),
         await_span: tracing::Span::none(),
     });

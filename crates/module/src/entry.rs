@@ -1,6 +1,7 @@
 //! The valkey module entry point: the `valkey_module!` declaration, `init`, and command handlers.
 
 use configuration::Configuration;
+use dma_libfabric::RegionMode;
 use dma_traits::Advertisement;
 use valkey_module::alloc::ValkeyAlloc;
 use valkey_module::configuration::ConfigurationFlags;
@@ -65,31 +66,27 @@ fn init(context: &Context, _args: &[ValkeyString]) -> Status {
     Status::Ok
 }
 
-/// Install jemalloc extent hooks that deregister an RMA memory region as jemalloc reclaims the pages
-/// it covers, so page decay can stay on without a registration going stale, and tune the huge arena
-/// where oversize values live so freed ones recycle in place. See
-/// `dma_libfabric::install_region_hooks`.
+/// Settle how RMA memory regions are reclaimed. With jemalloc, install extent hooks that deregister
+/// a region as the pages it covers are reclaimed, so page decay can stay on without a registration
+/// going stale, and tune the huge arena where oversize values live so freed ones recycle in place.
+/// Without it, fall back to registering per transfer. See `dma_libfabric::install_region_hooks`.
 fn configure_allocator(
     context: &Context,
     huge_arena_decay_ms: i64,
     huge_arena_oversize_threshold: usize,
 ) {
-    let report = match dma_libfabric::install_region_hooks(
-        huge_arena_decay_ms,
-        huge_arena_oversize_threshold,
-    ) {
-        Ok(report) => report,
-        Err(error) => {
-            valkey_logger::warning(
-                context,
-                &format!(
-                    "valkey-dma: could NOT install region extent hooks — {error}. RMA registrations \
-                     may go stale under page decay; run with a jemalloc allocator.",
-                ),
-            );
-            return;
-        }
-    };
+    let report =
+        dma_libfabric::install_region_hooks(huge_arena_decay_ms, huge_arena_oversize_threshold);
+
+    if RegionMode::PerOperation == report.mode {
+        valkey_logger::warning(
+            context,
+            "valkey-dma: no jemalloc in the host, so RMA operands are registered per transfer and \
+             deregistered on completion. Correct, but fi_mr_reg runs on the fabric worker for every \
+             transfer — expect far lower throughput. Run against a jemalloc build for production.",
+        );
+        return;
+    }
 
     let huge = report
         .huge_arena

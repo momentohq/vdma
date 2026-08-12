@@ -19,7 +19,7 @@ use libfabric_sys::{
 use crate::configuration::{Configuration, Provider};
 use crate::connection::LibfabricConnection;
 use crate::error::{check, fabric_error};
-use crate::local_regions::LocalRegions;
+use crate::local_regions::{LocalOperand, LocalRegions};
 
 /// Guard a completion's `op_context` before the caller reclaims it as an owned allocation. A
 /// provider reporting a completion for an op we never posted would otherwise be boxed from null.
@@ -386,19 +386,20 @@ impl LibfabricEndpoint {
         )
     }
 
-    /// The local descriptor covering an RMA operand: registers its extent on first touch, then
-    /// returns the cached descriptor, which lives as long as the operand memory does — the extent
-    /// hooks deregister it when jemalloc reclaims the pages. Null for tcp and other providers
-    /// needing no local registration.
-    pub fn local_descriptor(
+    /// The local descriptor covering an RMA operand. A null descriptor and no registration for tcp
+    /// and other providers needing no local registration.
+    pub(crate) fn local_operand(
         &mut self,
         pointer: *mut u8,
         length: usize,
-    ) -> Result<*mut c_void, DmaError> {
+    ) -> Result<LocalOperand, DmaError> {
         if !self.requires_local_mr {
-            return Ok(ptr::null_mut());
+            return Ok(LocalOperand {
+                descriptor: ptr::null_mut(),
+                registration: None,
+            });
         }
-        self.local_regions.descriptor(pointer, length)
+        self.local_regions.operand(pointer, length)
     }
 
     /// Build a connection to an inserted peer. `remote_address` is the peer buffer's virtual address

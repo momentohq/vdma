@@ -19,7 +19,7 @@ mod server_dma_worker;
 pub use configuration::{Configuration, Provider};
 pub use devices::discover_domains;
 pub use endpoint::{EndpointInfo, LibfabricEndpoint, PeerHandle};
-pub use extent_hooks::{RegionHooksReport, install as install_region_hooks};
+pub use extent_hooks::{RegionHooksReport, RegionMode, install_region_hooks};
 pub use pool::Pool;
 pub use server::{
     BatchCompleter, Completion, DestinationAllocator, Direction, FabricServer, Outcome,
