@@ -1,5 +1,6 @@
 //! The root `Configuration` and TOML parsing, depending on the leaves for their local sections.
 
+use crate::jemalloc::JemallocConfiguration;
 use crate::observability::ObservabilityConfiguration;
 
 /// Re-export of the libfabric DMA section so callers configure it through one crate.
@@ -12,6 +13,9 @@ pub struct Configuration {
     /// `[dma-libfabric]`.
     #[serde(default, rename = "dma-libfabric")]
     pub dma_libfabric: DmaLibfabricConfiguration,
+    /// `[jemalloc]`.
+    #[serde(default)]
+    pub jemalloc: JemallocConfiguration,
     /// `[observability]`.
     #[serde(default)]
     pub observability: ObservabilityConfiguration,
@@ -102,6 +106,25 @@ mod tests {
             .console_host
             .expect("console host enabled");
         assert_eq!(console_host.listen, "0.0.0.0:9999".parse().expect("addr"));
+    }
+
+    #[test]
+    fn parses_jemalloc_section() {
+        let document = r#"
+            [jemalloc]
+            huge_arena_decay_ms = -1
+        "#;
+        let configuration = Configuration::from_toml(document).expect("section parses");
+        assert_eq!(configuration.jemalloc.huge_arena_decay_ms, -1);
+        // Unset keys keep their defaults rather than zeroing.
+        assert_eq!(
+            configuration.jemalloc.huge_arena_oversize_threshold,
+            Configuration::default()
+                .jemalloc
+                .huge_arena_oversize_threshold
+        );
+        // The knobs left [dma-libfabric]; a config still setting them there must fail loudly.
+        assert!(Configuration::from_toml("[dma-libfabric]\nhuge_arena_decay_ms = 1000\n").is_err());
     }
 
     #[test]

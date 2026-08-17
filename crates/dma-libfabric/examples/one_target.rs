@@ -1,0 +1,300 @@
+//! The passive peer `one_transfer` writes into: register a buffer, expose it for remote access,
+//! print the advertisement, and poll until the bytes land.
+//!
+//! ```text
+//! # terminal 1 — prints: advertisement: <address-hex> <rkey> <remote-addr>
+//! cargo run -p dma-libfabric --example one_target -- 127.0.0.1
+//! # terminal 2 — paste those three fields
+//! cargo run -p dma-libfabric --example one_transfer -- 127.0.0.1 <address-hex> <rkey> <remote-addr>
+//! ```
+//!
+//! Raw libfabric: a target uses no part of this crate, which is the initiator half. The contract is
+//! `design/Client.md`.
+
+use std::ffi::CString;
+use std::os::raw::c_void;
+use std::ptr;
+use std::time::{Duration, Instant};
+
+use dma_traits::{checksum, decode_hex, encode_hex};
+use libfabric_sys::{
+    FI_MR_ALLOCATED, FI_MR_LOCAL, FI_MR_PROV_KEY, FI_MR_VIRT_ADDR, FI_MSG, FI_READ, FI_RECV,
+    FI_REMOTE_READ, FI_REMOTE_WRITE, FI_RMA, FI_SOURCE, FI_TRANSMIT, FI_WRITE, fi_addr_t,
+    fi_allocinfo, fi_av_attr, fi_av_insert, fi_av_open, fi_av_type_FI_AV_MAP, fi_close, fi_cq_attr,
+    fi_cq_entry, fi_cq_format_FI_CQ_FORMAT_CONTEXT, fi_cq_open, fi_cq_read, fi_domain, fi_enable,
+    fi_endpoint, fi_ep_bind, fi_ep_type_FI_EP_RDM, fi_fabric, fi_freeinfo, fi_getinfo, fi_getname,
+    fi_info, fi_mr_key, fi_mr_reg, fi_version, fid_av, fid_cq, fid_domain, fid_ep, fid_fabric,
+    fid_mr,
+};
+
+const BUFFER_LEN: usize = 4096;
+
+/// What `one_transfer` writes. A write raises no completion here, so a full buffer of it is the
+/// arrival signal.
+const PATTERN: u8 = 0xab;
+
+/// Everything opened, closed on drop in reverse construction order.
+struct Target {
+    memory_region: *mut fid_mr,
+    endpoint: *mut fid_ep,
+    completion_queue: *mut fid_cq,
+    address_vector: *mut fid_av,
+    domain: *mut fid_domain,
+    fabric: *mut fid_fabric,
+    info: *mut fi_info,
+}
+
+impl Drop for Target {
+    fn drop(&mut self) {
+        // SAFETY: each fid is closed once, in reverse order, and null when never opened.
+        unsafe {
+            for fid in [
+                self.memory_region.cast::<c_void>(),
+                self.endpoint.cast::<c_void>(),
+                self.completion_queue.cast::<c_void>(),
+                self.address_vector.cast::<c_void>(),
+                self.domain.cast::<c_void>(),
+                self.fabric.cast::<c_void>(),
+            ] {
+                if !fid.is_null() {
+                    // Every fid_* starts with its `fid`, so the first field is the handle to close.
+                    fi_close(fid.cast());
+                }
+            }
+            if !self.info.is_null() {
+                fi_freeinfo(self.info);
+            }
+        }
+    }
+}
+
+fn check(code: i32, what: &str) -> Result<(), String> {
+    if 0 == code {
+        return Ok(());
+    }
+    Err(format!("{what} failed: {code}"))
+}
+
+fn main() -> Result<(), String> {
+    let mut arguments = std::env::args().skip(1);
+    let bind = arguments.next();
+    let initiator = arguments.next();
+
+    let mut target = Target {
+        memory_region: ptr::null_mut(),
+        endpoint: ptr::null_mut(),
+        completion_queue: ptr::null_mut(),
+        address_vector: ptr::null_mut(),
+        domain: ptr::null_mut(),
+        fabric: ptr::null_mut(),
+        info: ptr::null_mut(),
+    };
+
+    // Must match the initiator's hints or the two pick incompatible providers; mirrors
+    // `endpoint::query_info`.
+    let provider = CString::new("tcp").map_err(|_| "provider name".to_string())?;
+    let node = match &bind {
+        Some(bind) => Some(CString::new(bind.as_str()).map_err(|_| "bind address".to_string())?),
+        None => None,
+    };
+    // SAFETY: hints are freed below; the CStrings outlive the fi_getinfo call and are detached from
+    // the hints first, so fi_freeinfo doesn't free Rust-owned memory.
+    unsafe {
+        let hints = fi_allocinfo();
+        if hints.is_null() {
+            return Err("fi_allocinfo failed".into());
+        }
+        (*hints).caps =
+            u64::from(FI_MSG | FI_RMA | FI_READ | FI_WRITE | FI_REMOTE_READ | FI_REMOTE_WRITE);
+        (*(*hints).ep_attr).type_ = fi_ep_type_FI_EP_RDM;
+        (*(*hints).domain_attr).mr_mode =
+            (FI_MR_LOCAL | FI_MR_ALLOCATED | FI_MR_PROV_KEY | FI_MR_VIRT_ADDR) as i32;
+        (*(*hints).fabric_attr).prov_name = provider.as_ptr().cast_mut();
+        let (node_ptr, flags) = match &node {
+            Some(node) => (node.as_ptr(), FI_SOURCE),
+            None => (ptr::null(), 0),
+        };
+        let code = fi_getinfo(
+            fi_version(),
+            node_ptr,
+            ptr::null(),
+            flags,
+            hints,
+            &mut target.info,
+        );
+        (*(*hints).fabric_attr).prov_name = ptr::null_mut();
+        fi_freeinfo(hints);
+        check(code, "fi_getinfo")?;
+        if target.info.is_null() {
+            return Err("no provider matched".into());
+        }
+    }
+
+    // SAFETY: `target.info` is a live fi_info; each handle is stored in `target`, which closes them.
+    let uses_virtual_addressing = unsafe {
+        check(
+            fi_fabric(
+                (*target.info).fabric_attr,
+                &mut target.fabric,
+                ptr::null_mut(),
+            ),
+            "fi_fabric",
+        )?;
+        check(
+            fi_domain(
+                target.fabric,
+                target.info,
+                &mut target.domain,
+                ptr::null_mut(),
+            ),
+            "fi_domain",
+        )?;
+        let mut av_attr: fi_av_attr = std::mem::zeroed();
+        av_attr.type_ = fi_av_type_FI_AV_MAP;
+        check(
+            fi_av_open(
+                target.domain,
+                &mut av_attr,
+                &mut target.address_vector,
+                ptr::null_mut(),
+            ),
+            "fi_av_open",
+        )?;
+        let mut cq_attr: fi_cq_attr = std::mem::zeroed();
+        cq_attr.format = fi_cq_format_FI_CQ_FORMAT_CONTEXT;
+        check(
+            fi_cq_open(
+                target.domain,
+                &mut cq_attr,
+                &mut target.completion_queue,
+                ptr::null_mut(),
+            ),
+            "fi_cq_open",
+        )?;
+        check(
+            fi_endpoint(
+                target.domain,
+                target.info,
+                &mut target.endpoint,
+                ptr::null_mut(),
+            ),
+            "fi_endpoint",
+        )?;
+        check(
+            fi_ep_bind(target.endpoint, &mut (*target.address_vector).fid, 0),
+            "fi_ep_bind(av)",
+        )?;
+        check(
+            fi_ep_bind(
+                target.endpoint,
+                &mut (*target.completion_queue).fid,
+                u64::from(FI_TRANSMIT | FI_RECV),
+            ),
+            "fi_ep_bind(cq)",
+        )?;
+        check(fi_enable(target.endpoint), "fi_enable")?;
+        (*(*target.info).domain_attr).mr_mode as u32 & FI_MR_VIRT_ADDR != 0
+    };
+
+    // Remote-accessible, unlike the initiator's local-only operands.
+    let buffer = vec![0u8; BUFFER_LEN];
+    let pointer = buffer.as_ptr().cast_mut();
+    // SAFETY: `buffer` outlives the registration, which `target` closes before this returns.
+    let remote_key = unsafe {
+        check(
+            fi_mr_reg(
+                target.domain,
+                pointer.cast::<c_void>(),
+                BUFFER_LEN,
+                u64::from(FI_REMOTE_READ | FI_REMOTE_WRITE | FI_READ | FI_WRITE),
+                0,
+                0,
+                0,
+                &mut target.memory_region,
+                ptr::null_mut(),
+            ),
+            "fi_mr_reg",
+        )?;
+        fi_mr_key(target.memory_region)
+    };
+    // On FI_MR_VIRT_ADDR providers like efa the remote address is the buffer's virtual address; on
+    // tcp it is an offset into the region, so 0.
+    let remote_address = if uses_virtual_addressing {
+        pointer as u64
+    } else {
+        0
+    };
+
+    // SAFETY: writes `length` bytes of address into `address`, after asking for the size.
+    let address = unsafe {
+        let mut length: usize = 0;
+        fi_getname(&mut (*target.endpoint).fid, ptr::null_mut(), &mut length);
+        let mut address = vec![0u8; length];
+        check(
+            fi_getname(
+                &mut (*target.endpoint).fid,
+                address.as_mut_ptr().cast::<c_void>(),
+                &mut length,
+            ),
+            "fi_getname",
+        )?;
+        address.truncate(length);
+        address
+    };
+
+    // efa-direct requires a target to hold the initiator's address before it can be RMA'd against.
+    // tcp does not.
+    if let Some(initiator) = &initiator {
+        let bytes = decode_hex(initiator.as_bytes()).map_err(|error| error.to_string())?;
+        let mut peer: fi_addr_t = 0;
+        // SAFETY: one address of the provider's own format, from the initiator.
+        let inserted = unsafe {
+            fi_av_insert(
+                target.address_vector,
+                bytes.as_ptr().cast::<c_void>(),
+                1,
+                &mut peer,
+                0,
+                ptr::null_mut(),
+            )
+        };
+        if 1 != inserted {
+            return Err(format!("fi_av_insert inserted {inserted} of 1"));
+        }
+    }
+
+    println!(
+        "advertisement: {} {remote_key} {remote_address}",
+        encode_hex(&address)
+    );
+    println!("waiting for a transfer into {BUFFER_LEN} bytes...");
+
+    // Under FI_PROGRESS_MANUAL nothing services the inbound RMA unless the queue is polled, and the
+    // write raises no completion here — so poll for progress, watch the buffer for arrival.
+    let deadline = Instant::now() + Duration::from_secs(300);
+    while Instant::now() < deadline {
+        // SAFETY: a one-entry read into an owned value; the queue is live until `target` drops.
+        unsafe {
+            let mut entry: fi_cq_entry = std::mem::zeroed();
+            fi_cq_read(
+                target.completion_queue,
+                (&raw mut entry).cast::<c_void>(),
+                1,
+            );
+        }
+        // Volatile: the NIC writes these bytes outside the compiler's model.
+        // SAFETY: in bounds of the live registered buffer.
+        let landed =
+            (0..BUFFER_LEN).all(|index| PATTERN == unsafe { pointer.add(index).read_volatile() });
+        if landed {
+            // The CRC the initiator also prints, so the pair cross-checks.
+            println!(
+                "received {BUFFER_LEN} bytes, crc {:#010x} — payload verified",
+                checksum(&buffer)
+            );
+            return Ok(());
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    Err("timed out waiting for a transfer".into())
+}

@@ -96,8 +96,8 @@ pub enum WorkerMessage<TContext> {
     RemovePeer(u64),
 }
 
-/// A sideband an rpc server like valkey uses to implement data-transfer commands over a faster
-/// transport. It does no rpc of its own.
+/// A sideband an rpc server uses to implement data-transfer commands over a faster transport. It
+/// does no rpc of its own.
 ///
 /// Owns the `fabric-nn` worker thread and the submission channel. Dropping the server closes the
 /// channel, so the worker drains its in-flight ops, exits, and is joined.
@@ -179,7 +179,7 @@ impl<TContext: Send + 'static> FabricServer<TContext> {
 
     /// The worker endpoint's fabric address, which a client discovers via `dma.hello` before the
     /// server RMAs against it: on efa-direct the target must hold the initiator's address in its
-    /// address vector. The valkey dma module initiates every dma itself.
+    /// address vector. This side initiates every dma itself.
     pub fn local_address(&self) -> &[u8] {
         &self.address
     }

@@ -202,7 +202,7 @@ pub fn worker_main<T: DestinationAllocator + Send + 'static>(
 
         if !completions.is_empty() {
             if completions.len() < TARGET_COMPLETIONS && drain_spins < 10 {
-                // let's not take the gil again juuuust yet.
+                // let's not run `complete_batch` again juuuust yet.
                 std::hint::spin_loop();
                 drain_spins += 1;
                 continue;
@@ -266,8 +266,8 @@ fn should_flush_crc(batched: usize, posted: usize, reaped_any: bool, about_to_pa
     0 < batched && (batched >= TARGET_COMPLETIONS || (0 == posted && !reaped_any) || about_to_park)
 }
 
-/// Finish checksummed completions on the pool: hash each payload, then run the batch's GIL commit
-/// and reply, all off the fabric worker.
+/// Finish checksummed completions on the pool: hash each payload, then run the batch's
+/// `complete_batch`, all off the fabric worker.
 fn submit_crc_batch<T: DestinationAllocator + Send + 'static>(
     pool: &Arc<Pool>,
     complete_batch: &Arc<BatchCompleter<T>>,
@@ -518,7 +518,7 @@ struct Prepared<T> {
 fn prepare<T: DestinationAllocator>(mut request: TransferRequest<T>) -> Prepared<T> {
     let length = request.buffer.length;
     // `ToPeer` writes from the caller's source buffer; `FromPeer` allocates its landing buffer here,
-    // on the worker thread, keeping that allocation off the submitting (GIL) thread.
+    // on the worker thread, keeping that allocation off the submitting thread.
     let pointer = match request.direction {
         Direction::ToPeer => request.buffer.pointer,
         Direction::FromPeer => request.caller_context.allocate(length),

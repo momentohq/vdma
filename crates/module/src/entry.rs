@@ -1,7 +1,6 @@
 //! The valkey module entry point: the `valkey_module!` declaration, `init`, and command handlers.
 
 use configuration::Configuration;
-use dma_libfabric::RegionMode;
 use dma_traits::Advertisement;
 use valkey_module::alloc::ValkeyAlloc;
 use valkey_module::configuration::ConfigurationFlags;
@@ -9,8 +8,9 @@ use valkey_module::{
     Context, Status, ValkeyError, ValkeyResult, ValkeyString, ValkeyValue, valkey_module,
 };
 
+use crate::memory::RegionMode;
 use crate::valkey_error::command_error;
-use crate::{observability, session, static_state, transfer, valkey_logger};
+use crate::{memory, observability, session, static_state, transfer, valkey_logger};
 
 valkey_module! {
     name: "valkey-dma",
@@ -50,8 +50,8 @@ fn init(context: &Context, _args: &[ValkeyString]) -> Status {
 
     configure_allocator(
         context,
-        configuration.dma_libfabric.huge_arena_decay_ms,
-        configuration.dma_libfabric.huge_arena_oversize_threshold,
+        configuration.jemalloc.huge_arena_decay_ms,
+        configuration.jemalloc.huge_arena_oversize_threshold,
     );
 
     static_state::set_configuration(configuration);
@@ -69,14 +69,13 @@ fn init(context: &Context, _args: &[ValkeyString]) -> Status {
 /// Settle how RMA memory regions are reclaimed. With jemalloc, install extent hooks that deregister
 /// a region as the pages it covers are reclaimed, so page decay can stay on without a registration
 /// going stale, and tune the huge arena where oversize values live so freed ones recycle in place.
-/// Without it, fall back to registering per transfer. See `dma_libfabric::install_region_hooks`.
+/// Without it, fall back to registering per transfer. See [`crate::memory::install`].
 fn configure_allocator(
     context: &Context,
     huge_arena_decay_ms: i64,
     huge_arena_oversize_threshold: usize,
 ) {
-    let report =
-        dma_libfabric::install_region_hooks(huge_arena_decay_ms, huge_arena_oversize_threshold);
+    let report = memory::install(huge_arena_decay_ms, huge_arena_oversize_threshold);
 
     if RegionMode::PerOperation == report.mode {
         valkey_logger::warning(
