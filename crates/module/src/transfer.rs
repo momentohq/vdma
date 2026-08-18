@@ -18,7 +18,7 @@ use dma_libfabric::{
     Completion, Configuration as FabricConfiguration, Direction, FabricServer, Outcome, Pool,
     Provider, TransferBuffer, TransferDone, TransferRequest,
 };
-use dma_traits::{Advertisement, DmaError, encode_hex};
+use dma_libfabric_protocol::{Advertisement, DmaError, encode_hex};
 use valkey_module::{
     BlockedClient, Context, ThreadSafeContext, ValkeyError, ValkeyResult, ValkeyString, ValkeyValue,
 };

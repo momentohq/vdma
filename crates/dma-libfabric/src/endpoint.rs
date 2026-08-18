@@ -5,8 +5,7 @@ use std::ffi::{CStr, CString};
 use std::os::raw::c_void;
 use std::ptr;
 
-use dma_traits::DmaError;
-use libfabric_sys::{
+use crate::sys::{
     FI_CONTEXT2, FI_EAGAIN, FI_EAVAIL, FI_MR_ALLOCATED, FI_MR_ENDPOINT, FI_MR_HMEM, FI_MR_LOCAL,
     FI_MR_PROV_KEY, FI_MR_VIRT_ADDR, FI_MSG, FI_READ, FI_RECV, FI_REMOTE_READ, FI_REMOTE_WRITE,
     FI_RMA, FI_SOURCE, FI_TRANSMIT, FI_WRITE, fi_addr_t, fi_allocinfo, fi_av_attr, fi_av_insert,
@@ -15,6 +14,7 @@ use libfabric_sys::{
     fi_dupinfo, fi_enable, fi_endpoint, fi_ep_bind, fi_ep_type_FI_EP_RDM, fi_fabric, fi_freeinfo,
     fi_getinfo, fi_getname, fi_info, fi_version, fid_av, fid_cq, fid_domain, fid_ep, fid_fabric,
 };
+use dma_libfabric_protocol::DmaError;
 
 use crate::configuration::{Configuration, Provider};
 use crate::connection::LibfabricConnection;
@@ -504,7 +504,7 @@ pub struct PeerHandle(fi_addr_t);
 
 impl Drop for LibfabricEndpoint {
     fn drop(&mut self) {
-        use libfabric_sys::fi_close;
+        use crate::sys::fi_close;
         // The local memory regions are domain objects, so they must close before the domain. The
         // worker has joined, so no in-flight op still holds an Rc clone.
         self.local_regions.clear();

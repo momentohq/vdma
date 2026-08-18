@@ -314,14 +314,16 @@ dependencies = [
 name = "dma-libfabric"
 version = "0.1.0"
 dependencies = [
- "dma-traits",
- "libfabric-sys",
+ "bindgen 0.72.1",
+ "cc",
+ "dma-libfabric-protocol",
+ "pkg-config",
  "serde",
  "tracing",
 ]
 
 [[package]]
-name = "dma-traits"
+name = "dma-libfabric-protocol"
 version = "0.1.0"
 dependencies = [
  "crc-fast",
@@ -596,15 +598,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3eaf3ede3fee6db1a4c2ee091bf8a8b4dccdc6d17f656fb07896ee72867612f2"
 
 [[package]]
-name = "libfabric-sys"
-version = "0.1.0"
-dependencies = [
- "bindgen 0.72.1",
- "cc",
- "pkg-config",
-]
-
-[[package]]
 name = "libloading"
 version = "0.8.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -687,7 +680,7 @@ version = "0.1.0"
 dependencies = [
  "configuration",
  "dma-libfabric",
- "dma-traits",
+ "dma-libfabric-protocol",
  "linkme",
  "tokio",
  "tracing",

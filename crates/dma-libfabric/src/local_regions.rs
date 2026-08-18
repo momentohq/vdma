@@ -13,8 +13,8 @@
 use std::os::raw::c_void;
 use std::ptr;
 
-use dma_traits::DmaError;
-use libfabric_sys::{FI_READ, FI_WRITE, fi_close, fi_mr_desc, fi_mr_reg, fid_domain, fid_mr};
+use crate::sys::{FI_READ, FI_WRITE, fi_close, fi_mr_desc, fi_mr_reg, fid_domain, fid_mr};
+use dma_libfabric_protocol::DmaError;
 
 use crate::error::check;
 use crate::region_cache;

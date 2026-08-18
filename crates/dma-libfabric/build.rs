@@ -1,5 +1,7 @@
 //! Generates libfabric FFI bindings with bindgen and compiles wrappers for its `static inline`
 //! functions, which call through `fid` op-tables and aren't otherwise linkable.
+// Build scripts fail by panicking.
+#![allow(clippy::expect_used)]
 
 use std::env;
 use std::path::PathBuf;

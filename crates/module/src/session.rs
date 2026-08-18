@@ -8,7 +8,7 @@ use std::cell::RefCell;
 
 use configuration::Configuration;
 use dma_libfabric::{EndpointInfo, LibfabricEndpoint};
-use dma_traits::DmaError;
+use dma_libfabric_protocol::DmaError;
 
 thread_local! {
     static ENDPOINT: RefCell<Option<LibfabricEndpoint>> = const { RefCell::new(None) };

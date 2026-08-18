@@ -3,7 +3,7 @@
 use std::marker::PhantomData;
 use std::os::raw::c_void;
 
-use libfabric_sys::{
+use crate::sys::{
     FI_DELIVERY_COMPLETE, fi_addr_t, fi_msg_rma, fi_read, fi_rma_iov, fi_writemsg, fid_ep, iovec,
 };
 

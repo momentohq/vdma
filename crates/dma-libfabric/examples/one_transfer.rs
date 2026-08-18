@@ -19,7 +19,7 @@ use dma_libfabric::{
     Completion, Configuration, DestinationAllocator, Direction, FabricServer, Outcome, Pool,
     Provider, TransferBuffer, TransferRequest,
 };
-use dma_traits::{Advertisement, DmaError, encode_hex};
+use dma_libfabric_protocol::{Advertisement, DmaError, encode_hex};
 
 /// The per-op context, carried to the worker and handed back at completion.
 struct Operation {

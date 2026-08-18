@@ -1,7 +1,7 @@
 //! The valkey module entry point: the `valkey_module!` declaration, `init`, and command handlers.
 
 use configuration::Configuration;
-use dma_traits::Advertisement;
+use dma_libfabric_protocol::Advertisement;
 use valkey_module::alloc::ValkeyAlloc;
 use valkey_module::configuration::ConfigurationFlags;
 use valkey_module::{
@@ -196,14 +196,14 @@ fn parse_data_args(args: &[ValkeyString]) -> Result<DataArgs<'_>, ValkeyError> {
 
 /// Parse a decimal byte length from a command argument.
 fn parse_length(raw: &[u8]) -> Result<usize, ValkeyError> {
-    dma_traits::parse_ascii(raw).ok_or(ValkeyError::Str(
+    dma_libfabric_protocol::parse_ascii(raw).ok_or(ValkeyError::Str(
         "ERR length is not an integer or out of range",
     ))
 }
 
 /// Parse a decimal CRC32 from a command argument.
 fn parse_crc(raw: &[u8]) -> Result<u32, ValkeyError> {
-    dma_traits::parse_ascii(raw).ok_or(ValkeyError::Str(
+    dma_libfabric_protocol::parse_ascii(raw).ok_or(ValkeyError::Str(
         "ERR crc is not an integer or out of range",
     ))
 }

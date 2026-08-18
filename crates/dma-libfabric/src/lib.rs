@@ -15,6 +15,8 @@ mod pool;
 mod region_cache;
 mod server;
 mod server_dma_worker;
+#[doc(hidden)]
+pub mod sys;
 
 pub use configuration::{Configuration, Provider};
 pub use devices::discover_domains;

@@ -14,7 +14,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{Sender, channel};
 use std::thread::JoinHandle;
 
-use dma_traits::DmaError;
+use dma_libfabric_protocol::DmaError;
 
 use crate::configuration::Configuration;
 use crate::pool::Pool;

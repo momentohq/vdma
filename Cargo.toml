@@ -3,8 +3,7 @@ resolver = "2"
 members = [
     "crates/configuration",
     "crates/dma-libfabric",
-    "crates/dma-traits",
-    "crates/libfabric-sys",
+    "crates/dma-libfabric-protocol",
     "crates/module",
 ]
 
@@ -16,23 +15,22 @@ publish = false
 
 [workspace.dependencies]
 # Local crates
-configuration        = { path = "crates/configuration" }
-dma-libfabric        = { path = "crates/dma-libfabric" }
-dma-traits           = { path = "crates/dma-traits" }
-libfabric-sys        = { path = "crates/libfabric-sys" }
+configuration          = { path = "crates/configuration" }
+dma-libfabric          = { path = "crates/dma-libfabric" }
+dma-libfabric-protocol = { path = "crates/dma-libfabric-protocol" }
 
 # External
-crc-fast             = { version = "1.10", default-features = false, features = ["std"] }
-linkme               = { version = "0.3" }
-serde                = { version = "1", features = ["derive"] }
-thiserror            = { version = "2" }
-tokio                = { version = "1", features = ["io-std", "io-util", "macros", "net", "rt", "rt-multi-thread", "time"] }
-toml                 = { version = "1.1" }
-tracing              = { version = "0.1" }
-tracing-cache        = { version = "0.2" }
-tracing-console-host = { version = "0.2" }
-valkey-module        = { path = "/Users/kenny/gits/valkeymodule-rs" }
-valkey-module-macros = { path = "/Users/kenny/gits/valkeymodule-rs/valkeymodule-rs-macros" }
+crc-fast               = { version = "1.10", default-features = false, features = ["std"] }
+linkme                 = { version = "0.3" }
+serde                  = { version = "1", features = ["derive"] }
+thiserror              = { version = "2" }
+tokio                  = { version = "1", features = ["io-std", "io-util", "macros", "net", "rt", "rt-multi-thread", "time"] }
+toml                   = { version = "1.1" }
+tracing                = { version = "0.1" }
+tracing-cache          = { version = "0.2" }
+tracing-console-host   = { version = "0.2" }
+valkey-module          = { path = "/Users/kenny/gits/valkeymodule-rs" }
+valkey-module-macros   = { path = "/Users/kenny/gits/valkeymodule-rs/valkeymodule-rs-macros" }
 
 [workspace.lints.rust]
 # Deny all warnings; priority -1 lets the specific lints below override the group.

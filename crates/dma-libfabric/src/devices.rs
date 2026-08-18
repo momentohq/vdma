@@ -4,8 +4,8 @@
 
 use std::ffi::CStr;
 
-use dma_traits::DmaError;
-use libfabric_sys::fi_freeinfo;
+use crate::sys::fi_freeinfo;
+use dma_libfabric_protocol::DmaError;
 
 use crate::configuration::Configuration;
 use crate::endpoint::query_info;

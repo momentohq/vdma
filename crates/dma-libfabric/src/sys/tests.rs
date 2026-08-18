@@ -1,4 +1,4 @@
-//! Runtime smoke tests: prove the bindings link and libfabric actually responds.
+//! Runtime smoke tests
 
 use std::ffi::CStr;
 use std::ptr;

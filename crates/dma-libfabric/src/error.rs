@@ -3,8 +3,8 @@
 use std::ffi::CStr;
 use std::os::raw::c_char;
 
-use dma_traits::DmaError;
-use libfabric_sys::{fi_cq_err_entry, fi_cq_strerror, fi_strerror, fid_cq};
+use crate::sys::{fi_cq_err_entry, fi_cq_strerror, fi_strerror, fid_cq};
+use dma_libfabric_protocol::DmaError;
 
 /// Turn a libfabric return code, 0 for ok and negative for `-errno`, into a `Result`.
 pub(crate) fn check(code: i32, what: &'static str) -> Result<(), DmaError> {

@@ -4,12 +4,17 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 publish.workspace = true
+links = "fabric"
 
 [dependencies]
-dma-traits           = { workspace = true }
-libfabric-sys        = { workspace = true }
-serde                = { workspace = true }
-tracing              = { workspace = true }
+dma-libfabric-protocol = { workspace = true }
+serde                  = { workspace = true }
+tracing                = { workspace = true }
+
+[build-dependencies]
+bindgen                = { version = "0.72", features = ["experimental"] }
+cc                     = { version = "1" }
+pkg-config             = { version = "0.3" }
 
 [lints]
 workspace = true

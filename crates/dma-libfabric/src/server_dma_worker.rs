@@ -1,7 +1,7 @@
-use dma_traits::DmaError;
-use dma_traits::checksum;
-use libfabric_sys::FI_EAGAIN;
-use libfabric_sys::fi_context2;
+use crate::sys::FI_EAGAIN;
+use crate::sys::fi_context2;
+use dma_libfabric_protocol::DmaError;
+use dma_libfabric_protocol::checksum;
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::collections::VecDeque;

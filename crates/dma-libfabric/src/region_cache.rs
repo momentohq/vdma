@@ -11,7 +11,7 @@
 use std::collections::BTreeMap;
 use std::sync::{Mutex, OnceLock};
 
-use libfabric_sys::{fi_close, fid_mr};
+use crate::sys::{fi_close, fid_mr};
 
 /// Your promise that you will call [`invalidate`] over any range whose pages you are about to
 /// be reclaim. Required for `fi_mr_reg` caching.

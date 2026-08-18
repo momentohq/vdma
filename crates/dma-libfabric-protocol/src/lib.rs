@@ -1,6 +1,6 @@
 //! The wire vocabulary shared by the module and the fabric layer: what a client advertises, how a
-//! payload is checksummed, and how a DMA failure is reported. Independent of both valkey and
-//! libfabric.
+//! payload is checksummed, and how a DMA failure is reported. Names the protocol, not the transport
+//! — no valkey or libfabric type appears here.
 
 mod advertisement;
 mod checksum;

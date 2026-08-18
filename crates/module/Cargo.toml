@@ -9,20 +9,20 @@ publish.workspace = true
 crate-type = ["cdylib"]
 
 [dependencies]
-configuration        = { workspace = true }
-dma-libfabric        = { workspace = true }
-dma-traits           = { workspace = true }
-linkme               = { workspace = true }
+configuration          = { workspace = true }
+dma-libfabric          = { workspace = true }
+dma-libfabric-protocol = { workspace = true }
+linkme                 = { workspace = true }
 
-tokio                = { workspace = true }
-tracing              = { workspace = true }
-tracing-cache        = { workspace = true }
-tracing-console-host = { workspace = true }
-valkey-module        = { workspace = true }
-valkey-module-macros = { workspace = true }
+tokio                  = { workspace = true }
+tracing                = { workspace = true }
+tracing-cache          = { workspace = true }
+tracing-console-host   = { workspace = true }
+valkey-module          = { workspace = true }
+valkey-module-macros   = { workspace = true }
 
 [dev-dependencies]
-valkey-module        = { workspace = true, features = ["enable-system-alloc"] }
+valkey-module          = { workspace = true, features = ["enable-system-alloc"] }
 
 [lints]
 workspace = true
