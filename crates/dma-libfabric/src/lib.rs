@@ -14,6 +14,7 @@ mod devices;
 mod endpoint;
 mod error;
 mod local_regions;
+mod operands;
 mod pool;
 mod region_cache;
 mod server;
@@ -24,9 +25,9 @@ pub mod sys;
 pub use configuration::{Configuration, Provider};
 pub use devices::discover_domains;
 pub use endpoint::{EndpointInfo, LibfabricEndpoint, PeerHandle};
+pub use operands::Operands;
 pub use pool::Pool;
 pub use region_cache::{ReclaimNotifier, install_reclaim_notifier, invalidate};
 pub use server::{
-    BatchCompleter, Completion, DestinationAllocator, Direction, FabricServer, Outcome,
-    TransferBuffer, TransferDone, TransferRequest,
+    BatchCompleter, Completion, Direction, FabricServer, Outcome, TransferDone, TransferRequest,
 };

@@ -12,9 +12,21 @@ The "peer" is a passive target, or a "client."
 # What you provide
 
 **A per-op context type.** A `Send + 'static` type you use for completions. It bundles with the
-request and comes back to you at completion. It must implement `DestinationAllocator`, which the
-worker calls to choose the buffer for a `FromPeer` transfer. `ToPeer` transfers carry their source
-buffer in the request instead.
+request and comes back to you at completion. It must implement `Operands`, which is how local memory
+is provided:
+
+```rust
+pub trait Operands {
+    /// The bytes a `ToPeer` transfer sends.
+    fn source(&self) -> Option<&[u8]> { None }
+    /// The buffer a `FromPeer` receives into.
+    fn allocate(&mut self, length: usize) -> Option<&mut [u8]> { None }
+}
+```
+
+Both default to unsupported, so a context must implement the direction it serves. A transfer
+whose direction has no operand fails. `Vec<u8>` implements both, so it works as a context if
+you want to use it to get started.
 
 **A completion hook**, `BatchCompleter<T> = Box<dyn Fn(Drain<Completion<T>>) + Send + Sync>`. This
 receives batches of completions. Batches are done to try to minimize downstream synchronization
@@ -60,7 +72,8 @@ anything.
 ### Your hooks
 Your completion hook is `Fn`, and it is `Send + Sync` because it is called from the fabric worker and
 from pool threads, possibly at the same time. Anything mutable inside it must be synchronized.
-`DestinationAllocator::allocate` runs on the fabric worker synchronously per worker. Allocate quickly.
+`Operands::source` and `Operands::allocate` run on the fabric worker synchronously per worker, before
+the transfer is posted. Be quick.
 
 Do not block your hooks. Time spent in your hooks on the fabric worker is time that libfabric endpoint
 is not posting or reaping, which delays every transfer on that device. Heavy or lock-contended work
@@ -79,8 +92,9 @@ produce one.
    hold it in its own address vector before you RMA against it. That means your control channel has to
    deliver every device's address, since any of them may serve a given transfer.
 3. **Transfer.** Build and submit a `TransferRequest`, which is your `client_id`, a peer address, remote
-   key, remote address, byte buffer, direction, choice of CRC, and your context. (Keep that `client_id`
-   stable for the life of your client and don't reuse client ids)
+   key, remote address, direction (`ToPeer`, or `FromPeer { length }` for how many bytes to read),
+   choice of CRC, and your context. (Keep that `client_id` stable for the life of your client and don't
+   reuse client ids)
 4. **Complete.** Your hook receives `Completion { caller_context, outcome }`. Completions are unordered
    with respect to submission.
 5. **Disconnect.** `remove_peer(client_id)` drops that id's address-vector entry. It is ordered after
@@ -106,13 +120,14 @@ let (outcome, operation) = server.transfer(request)?.await;
 `Transfer` is a plain `Future`, and doesn't expect any particular hosting runtime. It uses Wakers directly.
 
 **Dropping the future abandons the transfer, but does not release the memory.** The RMA is posted and there
-is no way to cancel it. On a dropped Transfer, when the completion lands your context is dropped. Your
-context's `Drop` must release whatever `allocate` returned, and you mustn't modify the memory before then.
+is no way to cancel it. On a dropped Transfer, your context is dropped. You should release any held operand
+memory on context drop.
 
 # Buffers and memory
 
-A `TransferBuffer` is a raw pointer and length. It must stay pinned and unmodified in memory until its
-completion is handed back. That invariant must be upheld for its `unsafe impl Send` to hold.
+The operand your context hands over must stay where it is, unmodified, until the completion comes
+back. The worker holds your context, so bytes your context owns are expected to be owned. Nothing else may
+write them until completion.
 
 EFA requires `FI_MR_LOCAL`. Every local operand must be registered, and `fi_mr_reg` costs time.
 `dma-libfabric` therefore optionally caches registrations, but the cache requires you to install a

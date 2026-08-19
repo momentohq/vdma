@@ -5,7 +5,7 @@
 //!
 //! Drop a [`Transfer`] and you abandon the transfer, but you don't own the memory yet. The RMA is
 //! already posted and there is no cancelling it. When the completion lands, your context will be
-//! dropped, so its `Drop` is what releases whatever `allocate` handed out. That drop runs on the fabric
+//! dropped, so its `Drop` is what releases the operand. That drop runs on the fabric
 //! worker or a pool thread, so it has the same rule as the hooks. It needs to run quickly and not panic.
 
 use std::future::Future;
@@ -16,9 +16,10 @@ use std::task::{Context, Poll, Waker};
 use dma_libfabric_protocol::DmaError;
 
 use crate::configuration::Configuration;
+use crate::operands::Operands;
 use crate::pool::Pool;
 use crate::server::{
-    Completion, DestinationAllocator, Outcome, TransferRequest, {self},
+    Completion, Outcome, TransferRequest, {self},
 };
 
 struct Cell<TContext> {
@@ -51,9 +52,14 @@ impl<TContext> std::fmt::Debug for Awaited<TContext> {
     }
 }
 
-impl<TContext: DestinationAllocator> DestinationAllocator for Awaited<TContext> {
+impl<TContext: Operands> Operands for Awaited<TContext> {
     /// pass through to user context
-    fn allocate(&mut self, length: usize) -> *mut u8 {
+    fn source(&self) -> Option<&[u8]> {
+        self.user.source()
+    }
+
+    /// pass through to user context
+    fn allocate(&mut self, length: usize) -> Option<&mut [u8]> {
         self.user.allocate(length)
     }
 }
@@ -131,7 +137,6 @@ fn map_context<TOld, TNew>(
         peer_address: request.peer_address,
         remote_key: request.remote_key,
         remote_address: request.remote_address,
-        buffer: request.buffer,
         direction: request.direction,
         want_checksum: request.want_checksum,
         caller_context: map(request.caller_context),
@@ -145,7 +150,7 @@ pub struct FabricServer<TContext: Send + 'static> {
     inner: server::FabricServer<Awaited<TContext>>,
 }
 
-impl<TContext: DestinationAllocator + Send + 'static> FabricServer<TContext> {
+impl<TContext: Operands + Send + 'static> FabricServer<TContext> {
     /// Open the endpoint, blocking until it is up or fails.
     pub fn start(configuration: &Configuration, pool: Arc<Pool>) -> Result<Self, DmaError> {
         let inner = server::FabricServer::start(configuration, Box::new(complete_batch), pool)?;

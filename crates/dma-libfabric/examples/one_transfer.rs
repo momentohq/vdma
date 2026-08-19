@@ -16,21 +16,21 @@ use std::sync::Arc;
 use std::sync::mpsc::{Sender, channel};
 
 use dma_libfabric::{
-    Completion, Configuration, DestinationAllocator, Direction, FabricServer, Outcome, Pool,
-    Provider, TransferBuffer, TransferRequest,
+    Completion, Configuration, Direction, FabricServer, Operands, Outcome, Pool, Provider,
+    TransferRequest,
 };
 use dma_libfabric_protocol::{Advertisement, DmaError, encode_hex};
 
 /// The per-op context, carried to the worker and handed back at completion.
 struct Operation {
+    payload: Vec<u8>,
     done: Sender<Outcome>,
 }
 
-impl DestinationAllocator for Operation {
-    /// Runs on the worker, so a `FromPeer` landing buffer is allocated off the submitting thread.
-    /// `ToPeer` supplies its buffer in the request, so this never runs here.
-    fn allocate(&mut self, _length: usize) -> *mut u8 {
-        std::ptr::null_mut()
+impl Operands for Operation {
+    /// The bytes this transfer writes into the peer. `FromPeer` would implement `allocate` instead.
+    fn source(&self) -> Option<&[u8]> {
+        Some(&self.payload)
     }
 }
 
@@ -75,13 +75,9 @@ fn main() -> Result<(), DmaError> {
         peer_address: peer.address,
         remote_key: peer.remote_key,
         remote_address: peer.remote_address,
-        buffer: TransferBuffer {
-            pointer: payload.as_ptr().cast_mut(),
-            length: payload.len(),
-        },
         direction: Direction::ToPeer,
         want_checksum: true,
-        caller_context: Operation { done },
+        caller_context: Operation { payload, done },
         parent_id: None,
     };
     if server.submit(request).is_err() {
@@ -96,7 +92,5 @@ fn main() -> Result<(), DmaError> {
         Ok(Err(error)) => println!("transfer failed: {error}"),
         Err(_) => println!("worker exited without completing the transfer"),
     }
-    // Alive and unmodified until the completion: what `TransferBuffer`'s `unsafe impl Send` rests on.
-    drop(payload);
     Ok(())
 }

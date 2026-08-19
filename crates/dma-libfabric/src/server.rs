@@ -17,35 +17,17 @@ use std::thread::JoinHandle;
 use dma_libfabric_protocol::DmaError;
 
 use crate::configuration::Configuration;
+use crate::operands::Operands;
 use crate::pool::Pool;
 
 /// Direction of the one-sided RMA the server initiates against the client's exposed buffer.
 #[derive(Debug, Clone, Copy)]
 pub enum Direction {
-    /// `fi_writemsg` local to peer: the `dma.get` path.
+    /// `fi_writemsg` local to peer: the `dma.get` path, sending [`Operands::source`].
     ToPeer,
-    /// `fi_read` peer to local: the `dma.set` path.
-    FromPeer,
-}
-
-/// A raw local buffer the worker transfers to or from. The submitter guarantees it stays valid and
-/// unmodified until the transfer's completion is handed back.
-#[derive(Clone, Copy)]
-pub struct TransferBuffer {
-    pub pointer: *mut u8,
-    pub length: usize,
-}
-
-// SAFETY: the submitter keeps `length` bytes alive until the completion runs, and the pointer is
-// dereferenced only on the worker thread, never concurrently with the submitter.
-unsafe impl Send for TransferBuffer {}
-
-/// Implemented by a transfer's caller context so the worker allocates the `FromPeer` landing buffer
-/// itself, keeping the allocation off the submitter's thread and any lock it holds. Runs once per
-/// `FromPeer` op in `prepare`, and the implementor retains the allocation until the completion is
-/// handed back. `ToPeer` transfers supply their source buffer in the request and never call this.
-pub trait DestinationAllocator {
-    fn allocate(&mut self, length: usize) -> *mut u8;
+    /// `fi_read` peer to local: the `dma.set` path, putting `length` bytes in
+    /// [`Operands::allocate`]. The peer's advertisement says how many bytes there are to read.
+    FromPeer { length: usize },
 }
 
 /// The result of a completed transfer: bytes moved, plus the CRC32 when one was requested.
@@ -69,14 +51,13 @@ pub struct Completion<T> {
 /// context `T` is opaque here; it carries whatever the caller needs to reply and commit.
 pub type BatchCompleter<T> = Box<dyn Fn(std::vec::Drain<Completion<T>>) + Send + Sync>;
 
-/// A submitted transfer: where the peer's exposed buffer is, the local buffer to move, and an opaque
-/// `caller_context` handed back when the RMA finishes.
+/// A submitted transfer: Where the peer's exposed buffer is, which way the bytes go, and a
+/// `caller_context` that supplies the local operand and is handed back when the RMA finishes.
 pub struct TransferRequest<TContext> {
     pub client_id: u64,
     pub peer_address: Vec<u8>,
     pub remote_key: u64,
     pub remote_address: u64,
-    pub buffer: TransferBuffer,
     pub direction: Direction,
     pub want_checksum: bool,
     pub caller_context: TContext,
@@ -133,7 +114,7 @@ impl<TContext: Send + 'static> FabricServer<TContext> {
         pool: Arc<Pool>,
     ) -> Result<Self, DmaError>
     where
-        TContext: DestinationAllocator,
+        TContext: Operands,
     {
         let (sender, receiver) = channel();
         let (ready_sender, ready_receiver) = channel();

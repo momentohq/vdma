@@ -15,9 +15,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use crate::BatchCompleter;
 use crate::Completion;
 use crate::Configuration;
-use crate::DestinationAllocator;
 use crate::Direction;
-use crate::TransferBuffer;
+use crate::Operands;
 use crate::TransferDone;
 use crate::TransferRequest;
 use crate::endpoint::{LibfabricEndpoint, PeerHandle};
@@ -36,7 +35,7 @@ pub struct CachedPeer {
     peer: PeerHandle,
 }
 
-pub fn worker_main<T: DestinationAllocator + Send + 'static>(
+pub fn worker_main<T: Operands + Send + 'static>(
     configuration: Configuration,
     ready: &Sender<Result<Vec<u8>, DmaError>>,
     receiver: &Receiver<WorkerMessage<T>>,
@@ -85,10 +84,13 @@ pub fn worker_main<T: DestinationAllocator + Send + 'static>(
         // Intake: drain the channel without blocking.
         loop {
             match receiver.try_recv() {
-                Ok(WorkerMessage::Transfer(request)) => {
-                    *outstanding_by_client.entry(request.client_id).or_insert(0) += 1;
-                    pending.push_back(prepare(request));
-                }
+                Ok(WorkerMessage::Transfer(request)) => accept(
+                    request,
+                    &mut outstanding_by_client,
+                    outstanding,
+                    &mut pending,
+                    &mut completions,
+                ),
                 Ok(WorkerMessage::RemovePeer(client_id)) => remove_or_defer(
                     &endpoint,
                     &mut peers,
@@ -110,42 +112,30 @@ pub fn worker_main<T: DestinationAllocator + Send + 'static>(
             let Some(prepared) = pending.pop_front() else {
                 break;
             };
-            match post(&mut endpoint, &mut peers, &prepared) {
+            let error = match post(&mut endpoint, &mut peers, &prepared) {
                 Ok(0) => {
                     in_flight += 1;
                     posted += 1;
+                    continue;
                 }
                 Ok(code) if code == again => {
                     pending.push_front(prepared); // tx queue full: defer, reap to make room
                     break;
                 }
-                // Post failed outright: the op finishes here and is never reaped, so account it.
-                Ok(code) => {
-                    let error = fabric_error(code as i32, "post");
-                    let client_id = prepared.client_id;
-                    completions.push(reclaim(prepared.context).into_completion(Err(error)));
-                    finish_op(
-                        &endpoint,
-                        &mut peers,
-                        &mut outstanding_by_client,
-                        &mut pending_removal,
-                        outstanding,
-                        client_id,
-                    );
-                }
-                Err(error) => {
-                    let client_id = prepared.client_id;
-                    completions.push(reclaim(prepared.context).into_completion(Err(error)));
-                    finish_op(
-                        &endpoint,
-                        &mut peers,
-                        &mut outstanding_by_client,
-                        &mut pending_removal,
-                        outstanding,
-                        client_id,
-                    );
-                }
-            }
+                Ok(code) => fabric_error(code as i32, "post"),
+                Err(error) => error,
+            };
+            // Post failed outright: the op finishes here and is never reaped, so account it.
+            let client_id = prepared.client_id;
+            completions.push(reclaim(prepared.context).into_completion(Err(error)));
+            finish_op(
+                &endpoint,
+                &mut peers,
+                &mut outstanding_by_client,
+                &mut pending_removal,
+                outstanding,
+                client_id,
+            );
         }
 
         // Reap up to 10, then dispatch — bounding what one batch, and so one downstream lock
@@ -217,10 +207,13 @@ pub fn worker_main<T: DestinationAllocator + Send + 'static>(
         if 0 == in_flight && pending.is_empty() {
             // Nothing outstanding: block on the channel to release the core.
             match receiver.recv() {
-                Ok(WorkerMessage::Transfer(request)) => {
-                    *outstanding_by_client.entry(request.client_id).or_insert(0) += 1;
-                    pending.push_back(prepare(request));
-                }
+                Ok(WorkerMessage::Transfer(request)) => accept(
+                    request,
+                    &mut outstanding_by_client,
+                    outstanding,
+                    &mut pending,
+                    &mut completions,
+                ),
                 // Nothing is outstanding here, so this client has no ops to drain: remove now.
                 Ok(WorkerMessage::RemovePeer(client_id)) => remove_or_defer(
                     &endpoint,
@@ -268,7 +261,7 @@ fn should_flush_crc(batched: usize, posted: usize, reaped_any: bool, about_to_pa
 
 /// Finish checksummed completions on the pool: hash each payload, then run the batch's
 /// `complete_batch`, all off the fabric worker.
-fn submit_crc_batch<T: DestinationAllocator + Send + 'static>(
+fn submit_crc_batch<T: Operands + Send + 'static>(
     pool: &Arc<Pool>,
     complete_batch: &Arc<BatchCompleter<T>>,
     batch: Vec<ReapedOp<T>>,
@@ -281,6 +274,26 @@ fn submit_crc_batch<T: DestinationAllocator + Send + 'static>(
             .collect();
         (*complete)(done.drain(..));
     }));
+}
+
+/// Queue a submitted transfer, or complete it when its operand doesn't resolve.
+fn accept<T: Operands>(
+    request: TransferRequest<T>,
+    outstanding_by_client: &mut HashMap<u64, usize>,
+    outstanding: &AtomicUsize,
+    pending: &mut VecDeque<Prepared<T>>,
+    completions: &mut Vec<Completion<T>>,
+) {
+    match prepare(request) {
+        Ok(prepared) => {
+            *outstanding_by_client.entry(prepared.client_id).or_insert(0) += 1;
+            pending.push_back(prepared);
+        }
+        Err(completion) => {
+            release_outstanding(outstanding);
+            completions.push(completion);
+        }
+    }
 }
 
 /// Remove a disconnected client's peer, or defer until its last op finishes. Removing with ops
@@ -309,11 +322,7 @@ fn finish_op(
     outstanding: &AtomicUsize,
     client_id: u64,
 ) {
-    // The device-wide counter `submit` raised. Saturating for the same reason the in-flight tally is:
-    // a stray extra finish must not wrap it and make this device look infinitely loaded forever.
-    let _ = outstanding.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
-        Some(current.saturating_sub(1))
-    });
+    release_outstanding(outstanding);
     let remaining = match outstanding_by_client.get_mut(&client_id) {
         Some(count) => {
             *count -= 1;
@@ -327,6 +336,14 @@ fn finish_op(
             drop_peer(endpoint, peers, client_id);
         }
     }
+}
+
+/// Drop one op from the device-wide tally `submit` raised.
+fn release_outstanding(outstanding: &AtomicUsize) {
+    // gotta saturate so it never sees a spurious wrap state
+    let _ = outstanding.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+        Some(current.saturating_sub(1))
+    });
 }
 
 /// Remove a client's address-vector entry and forget its cached handle. No-op if it never had one.
@@ -357,11 +374,11 @@ fn post<T>(
 ) -> Result<isize, DmaError> {
     let peer = peer_handle(endpoint, peers, prepared.client_id, &prepared.peer_address)?;
     let context = prepared.context.cast::<c_void>();
-    let length = prepared.buffer.length;
+    let length = prepared.length;
     let LocalOperand {
         descriptor,
         registration,
-    } = endpoint.local_operand(prepared.buffer.pointer, length)?;
+    } = endpoint.local_operand(prepared.pointer, length)?;
     let connection = endpoint.connection(peer, prepared.remote_key, prepared.remote_address);
     // On-wire time, as an explicit child of the caller's `dma.get`/`dma.set` span so the transfer
     // tree covers setup -> wire -> completion without entering the parent on this thread. Stored in
@@ -377,14 +394,14 @@ fn post<T>(
         let _posting = wire.enter();
         match prepared.direction {
             Direction::ToPeer => {
-                // SAFETY: the submitter keeps this buffer valid until the completion runs.
-                let bytes = unsafe { std::slice::from_raw_parts(prepared.buffer.pointer, length) };
+                // SAFETY: the operand lives in the caller context, which the `InFlight` holds until
+                //         the completion runs.
+                let bytes = unsafe { std::slice::from_raw_parts(prepared.pointer, length) };
                 connection.post_out(bytes, descriptor, context)
             }
-            Direction::FromPeer => {
+            Direction::FromPeer { .. } => {
                 // SAFETY: as above; no other thread touches the buffer until completion.
-                let bytes =
-                    unsafe { std::slice::from_raw_parts_mut(prepared.buffer.pointer, length) };
+                let bytes = unsafe { std::slice::from_raw_parts_mut(prepared.pointer, length) };
                 connection.post_in(bytes, descriptor, context)
             }
         }
@@ -479,13 +496,20 @@ unsafe impl<T: Send> Send for InFlight<T> {}
 impl<T> InFlight<T> {
     /// Turn a raw libfabric result into a [`Completion`], hashing the operand if asked. Checksummed
     /// ops run this on a pool worker, keeping the hash off the fabric worker.
-    fn into_completion(self, result: Result<(), DmaError>) -> Completion<T> {
+    ///
+    /// Takes the box rather than its contents so the hash runs before the caller context moves. The
+    /// operand may live inside that context, and the box keeps the address stable since `prepare`.
+    #[expect(
+        clippy::boxed_local,
+        reason = "the box pins the operand's address across the hash"
+    )]
+    fn into_completion(self: Box<Self>, result: Result<(), DmaError>) -> Completion<T> {
         let outcome = result.map(|()| {
             let checksum_value = self.want_checksum.then(|| {
                 let _span =
                     tracing::info_span!(parent: &self.wire_span, "checksum", length = self.length)
                         .entered();
-                // SAFETY: the caller retains the operand until this completion hands it back.
+                // SAFETY: the operand is the caller context's, still held by this `InFlight`.
                 checksum(unsafe { std::slice::from_raw_parts(self.buffer_pointer, self.length) })
             });
             TransferDone {
@@ -508,44 +532,73 @@ struct Prepared<T> {
     peer_address: Vec<u8>,
     remote_key: u64,
     remote_address: u64,
-    buffer: TransferBuffer,
+    /// The resolved local operand pointer must stay valid for the post.
+    pointer: *mut u8,
+    length: usize,
     direction: Direction,
     /// The caller's transfer span, parent of the on-wire span.
     parent_id: Option<tracing::span::Id>,
 }
 
-/// Build the per-op `InFlight` box and the post parameters.
-fn prepare<T: DestinationAllocator>(mut request: TransferRequest<T>) -> Prepared<T> {
-    let length = request.buffer.length;
-    // `ToPeer` writes from the caller's source buffer; `FromPeer` allocates its landing buffer here,
-    // on the worker thread, keeping that allocation off the submitting thread.
-    let pointer = match request.direction {
-        Direction::ToPeer => request.buffer.pointer,
-        Direction::FromPeer => request.caller_context.allocate(length),
-    };
-    let inflight = Box::new(InFlight {
+/// Build the per-op `InFlight` box and the post parameters, resolving the local operand out of the
+/// caller's context.
+/// Both run on the worker thread, keeping allocation off the submitting thread.
+fn prepare<T: Operands>(request: TransferRequest<T>) -> Result<Prepared<T>, Completion<T>> {
+    let mut inflight = Box::new(InFlight {
         // Provider-owned scratch; it initializes this when the op is posted.
         _context2: unsafe { std::mem::zeroed() },
         caller_context: request.caller_context,
         client_id: request.client_id,
-        length,
+        // Both set just below, once the operand resolves.
+        length: 0,
+        buffer_pointer: std::ptr::null_mut(),
         want_checksum: request.want_checksum,
-        buffer_pointer: pointer,
         // Set at post time, once the operand is registered.
         local_registration: None,
         wire_span: tracing::Span::none(),
         await_span: tracing::Span::none(),
     });
-    Prepared {
+    let operand = match request.direction {
+        Direction::ToPeer => match inflight.caller_context.source() {
+            Some(bytes) => Ok((bytes.as_ptr().cast_mut(), bytes.len())),
+            None => Err(DmaError::Fabric(
+                "the caller context supplied no source bytes for a ToPeer transfer".into(),
+            )),
+        },
+        Direction::FromPeer { length } => match inflight.caller_context.allocate(length) {
+            // Overrunning a short landing buffer would corrupt whatever follows it, so refuse.
+            Some(landing) if landing.len() < length => Err(DmaError::Fabric(format!(
+                "the caller context allocated {} bytes for a {length} byte FromPeer transfer",
+                landing.len()
+            ))),
+            Some(landing) => Ok((landing.as_mut_ptr(), length)),
+            None => Err(DmaError::Fabric(
+                "the caller context allocated no landing buffer for a FromPeer transfer".into(),
+            )),
+        },
+    };
+    let (pointer, length) = match operand {
+        Ok(operand) => operand,
+        Err(error) => {
+            return Err(Completion {
+                caller_context: inflight.caller_context,
+                outcome: Err(error),
+            });
+        }
+    };
+    inflight.buffer_pointer = pointer;
+    inflight.length = length;
+    Ok(Prepared {
         context: Box::into_raw(inflight),
         client_id: request.client_id,
         peer_address: request.peer_address,
         remote_key: request.remote_key,
         remote_address: request.remote_address,
-        buffer: TransferBuffer { pointer, length },
+        pointer,
+        length,
         direction: request.direction,
         parent_id: request.parent_id,
-    }
+    })
 }
 
 #[cfg(test)]

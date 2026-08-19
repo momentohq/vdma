@@ -10,9 +10,7 @@
 use std::sync::Arc;
 
 use dma_libfabric::asynchronous::FabricServer;
-use dma_libfabric::{
-    Configuration, DestinationAllocator, Direction, Pool, Provider, TransferBuffer, TransferRequest,
-};
+use dma_libfabric::{Configuration, Direction, Operands, Pool, Provider, TransferRequest};
 use dma_libfabric_protocol::{Advertisement, DmaError, encode_hex};
 
 /// The per-op context. It owns the payload, which keeps the buffer alive for the whole
@@ -21,10 +19,10 @@ struct Operation {
     payload: Vec<u8>,
 }
 
-impl DestinationAllocator for Operation {
-    /// `ToPeer` supplies its buffer in the request, so this never runs here.
-    fn allocate(&mut self, _length: usize) -> *mut u8 {
-        std::ptr::null_mut()
+impl Operands for Operation {
+    /// The bytes this transfer writes into the peer. `FromPeer` would implement `allocate` instead.
+    fn source(&self) -> Option<&[u8]> {
+        Some(&self.payload)
     }
 }
 
@@ -57,19 +55,13 @@ async fn main() -> Result<(), DmaError> {
     ])
     .map_err(|error| DmaError::Fabric(error.to_string()))?;
 
-    // `one_target` waits for a full buffer of this byte. Taken before the move into `Operation`: the
-    // heap allocation stays put when the `Vec` moves, so this pointer survives it.
+    // `one_target` waits for a full buffer of this byte.
     let payload = vec![0xab_u8; 4096];
-    let buffer = TransferBuffer {
-        pointer: payload.as_ptr().cast_mut(),
-        length: payload.len(),
-    };
     let request = TransferRequest {
         client_id: 1,
         peer_address: peer.address,
         remote_key: peer.remote_key,
         remote_address: peer.remote_address,
-        buffer,
         direction: Direction::ToPeer,
         want_checksum: true,
         caller_context: Operation { payload },

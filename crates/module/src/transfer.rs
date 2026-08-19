@@ -10,13 +10,12 @@
 //!   no-copy `StringSet` only once the optional CRC checks out, so the keyspace never sees a
 //!   half-written or corrupt value.
 
-use std::ptr;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 
 use dma_libfabric::{
-    Completion, Configuration as FabricConfiguration, Direction, FabricServer, Outcome, Pool,
-    Provider, TransferBuffer, TransferDone, TransferRequest,
+    Completion, Configuration as FabricConfiguration, Direction, FabricServer, Operands, Outcome,
+    Pool, Provider, TransferDone, TransferRequest,
 };
 use dma_libfabric_protocol::{Advertisement, DmaError, encode_hex};
 use valkey_module::{
@@ -42,8 +41,8 @@ enum OpToken {
     /// `DMA.SET`: verify CRC, commit the DMA'd destination into the key or error, reply.
     Set {
         blocked: BlockedClient,
-        /// The DMA landing buffer, allocated off the GIL by [`DestinationAllocator::allocate`]
-        /// before the `fi_read` is posted. `None` until then, and if the worker was gone.
+        /// The DMA landing buffer, allocated off the GIL by [`Operands::allocate`] before the
+        /// `fi_read` is posted. `None` until then, and if the worker was gone.
         destination: Option<ValkeyString>,
         key: ValkeyString,
         expected_crc: Option<u32>,
@@ -55,22 +54,32 @@ enum OpToken {
 // dereferenced under the GIL in `finish_under_gil`; no valkey API is called on them off the GIL.
 unsafe impl Send for OpToken {}
 
-impl dma_libfabric::DestinationAllocator for OpToken {
-    /// Allocate the SET landing buffer on the fabric worker rather than the valkey command thread,
-    /// returning its pointer for the `fi_read`. GET supplies its source buffer in the request.
-    fn allocate(&mut self, length: usize) -> *mut u8 {
+impl Operands for OpToken {
+    /// GET writes valkey's own value buffer out of the keyspace, held by a retained reference for
+    /// the length of the transfer.
+    fn source(&self) -> Option<&[u8]> {
+        match self {
+            OpToken::Get { held, .. } => Some(held.as_bytes()),
+            OpToken::Set { .. } => None,
+        }
+    }
+
+    /// Allocate the SET landing buffer on the fabric worker rather than the valkey command thread.
+    /// Off-keyspace until the CRC passes, when `finish_under_gil` commits it into the key no-copy.
+    fn allocate(&mut self, length: usize) -> Option<&mut [u8]> {
         match self {
             OpToken::Set {
                 destination, span, ..
             } => {
                 let _alloc =
                     tracing::info_span!(parent: span.id(), "alloc_destination", length).entered();
-                let mut value = ValkeyString::create_uninitialized(length);
-                let pointer = value.as_mut_slice().as_mut_ptr();
-                *destination = Some(value);
-                pointer
+                Some(
+                    destination
+                        .insert(ValkeyString::create_uninitialized(length))
+                        .as_mut_slice(),
+                )
             }
-            OpToken::Get { .. } => ptr::null_mut(),
+            OpToken::Get { .. } => None,
         }
     }
 }
@@ -404,7 +413,6 @@ pub fn dma_get(
             HeldValue::Copied(bytes.to_vec())
         }
     };
-    let pointer = held.as_bytes().as_ptr().cast_mut();
     drop(retain);
 
     // Block the client, build the request, hand it to the fabric worker.
@@ -425,7 +433,6 @@ pub fn dma_get(
         peer_address: advertisement.address.clone(),
         remote_key: advertisement.remote_key,
         remote_address: advertisement.remote_address,
-        buffer: TransferBuffer { pointer, length },
         direction: Direction::ToPeer,
         want_checksum,
         parent_id: transfer.id(),
@@ -467,12 +474,8 @@ pub fn dma_set(
         peer_address: advertisement.address.clone(),
         remote_key: advertisement.remote_key,
         remote_address: advertisement.remote_address,
-        // the worker allocates this off the gil
-        buffer: TransferBuffer {
-            pointer: ptr::null_mut(),
-            length,
-        },
-        direction: Direction::FromPeer,
+        // the worker allocates the valkeystring off the gil
+        direction: Direction::FromPeer { length },
         want_checksum: expected_crc.is_some(),
         parent_id: transfer.id(),
         caller_context: OpToken::Set {
