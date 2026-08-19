@@ -11,6 +11,9 @@ dma-libfabric-protocol = { workspace = true }
 serde                  = { workspace = true }
 tracing                = { workspace = true }
 
+[dev-dependencies]
+tokio                  = { workspace = true }
+
 [build-dependencies]
 bindgen                = { version = "0.72", features = ["experimental"] }
 cc                     = { version = "1" }

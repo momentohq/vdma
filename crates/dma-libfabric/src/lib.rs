@@ -4,7 +4,10 @@
 //! posts one-sided RMA against a client's exposed buffer and reaps completions. The peer address and
 //! remote key arrive out-of-band, on the caller's own control channel, per request. Clients are
 //! passive targets and live outside this crate.
+//!
+//! [`asynchronous`] is the same server with futures in place of a completion hook.
 
+pub mod asynchronous;
 mod configuration;
 mod connection;
 mod devices;

@@ -93,6 +93,22 @@ produce one.
 The submission channel doesn't model backpressure on your behalf. `FabricServer::outstanding()` counts
 submitted but unfinished transfers, and is useful for balancing across devices or throttling.
 
+# Awaiting instead of a completion hook
+
+`asynchronous::FabricServer` is the same server with futures in place of `BatchCompleter`. It installs
+its own completion hook. `transfer` hands you a future that resolves to your outcome and context.
+
+```rust
+let server: asynchronous::FabricServer<Operation> = asynchronous::FabricServer::start(&config, pool)?;
+let (outcome, operation) = server.transfer(request)?.await;
+```
+
+`Transfer` is a plain `Future`, and doesn't expect any particular hosting runtime. It uses Wakers directly.
+
+**Dropping the future abandons the transfer, but does not release the memory.** The RMA is posted and there
+is no way to cancel it. On a dropped Transfer, when the completion lands your context is dropped. Your
+context's `Drop` must release whatever `allocate` returned, and you mustn't modify the memory before then.
+
 # Buffers and memory
 
 A `TransferBuffer` is a raw pointer and length. It must stay pinned and unmodified in memory until its

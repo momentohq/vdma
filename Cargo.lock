@@ -319,6 +319,7 @@ dependencies = [
  "dma-libfabric-protocol",
  "pkg-config",
  "serde",
+ "tokio",
  "tracing",
 ]
 
