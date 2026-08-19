@@ -1,4 +1,4 @@
-//! The passive peer `one_transfer` writes into: register a buffer, expose it for remote access,
+//! The passive peer the other examples RMA against: register a buffer, expose it for remote access,
 //! print the advertisement, and poll until the bytes land.
 //!
 //! ```text
@@ -7,6 +7,9 @@
 //! # terminal 2 — paste those three fields
 //! cargo run -p dma-libfabric --example one_transfer -- 127.0.0.1 <address-hex> <rkey> <remote-addr>
 //! ```
+//!
+//! `--read` prefills the buffer and serves it to `read_from_peer` instead. This just holds the buffer
+//! open and lets the initiator do the verifying.
 //!
 //! Raw libfabric: a target uses no part of this crate, which is the initiator half. The contract is
 //! `design/Client.md`.
@@ -29,8 +32,7 @@ use dma_libfabric_protocol::{checksum, decode_hex, encode_hex};
 
 const BUFFER_LEN: usize = 4096;
 
-/// What `one_transfer` writes. A write raises no completion here, so a full buffer of it is the
-/// arrival signal.
+/// That which `one_transfer` writes and `read_from_peer` fetches.
 const PATTERN: u8 = 0xab;
 
 /// Everything opened, closed on drop in reverse construction order.
@@ -76,7 +78,12 @@ fn check(code: i32, what: &str) -> Result<(), String> {
 }
 
 fn main() -> Result<(), String> {
-    let mut arguments = std::env::args().skip(1);
+    let (flags, positional): (Vec<String>, Vec<String>) = std::env::args()
+        .skip(1)
+        .partition(|argument| argument.starts_with("--"));
+    // Serve the buffer for a remote read rather than wait for a remote write.
+    let serve_read = flags.iter().any(|flag| "--read" == flag);
+    let mut arguments = positional.into_iter();
     let bind = arguments.next();
     let initiator = arguments.next();
 
@@ -196,8 +203,9 @@ fn main() -> Result<(), String> {
         (*(*target.info).domain_attr).mr_mode as u32 & FI_MR_VIRT_ADDR != 0
     };
 
-    // Remote-accessible, unlike the initiator's local-only operands.
-    let buffer = vec![0u8; BUFFER_LEN];
+    // Remote-accessible, unlike the initiator's local-only operands. Prefilled when the initiator is
+    // the one fetching it.
+    let buffer = vec![if serve_read { PATTERN } else { 0 }; BUFFER_LEN];
     let pointer = buffer.as_ptr().cast_mut();
     // SAFETY: `buffer` outlives the registration, which `target` closes before this returns.
     let remote_key = unsafe {
@@ -267,7 +275,14 @@ fn main() -> Result<(), String> {
         "advertisement: {} {remote_key} {remote_address}",
         encode_hex(&address)
     );
-    println!("waiting for a transfer into {BUFFER_LEN} bytes...");
+    if serve_read {
+        println!(
+            "serving {BUFFER_LEN} bytes of {PATTERN:#04x} for a remote read, crc {:#010x} — the initiator verifies",
+            checksum(&buffer)
+        );
+    } else {
+        println!("waiting for a transfer into {BUFFER_LEN} bytes...");
+    }
 
     // Under FI_PROGRESS_MANUAL nothing services the inbound RMA unless the queue is polled, and the
     // write raises no completion here — so poll for progress, watch the buffer for arrival.
@@ -282,6 +297,12 @@ fn main() -> Result<(), String> {
                 1,
             );
         }
+        // A read leaves nothing behind here, so there is no arrival to watch for: hold the buffer
+        // open and keep polling until the window closes.
+        if serve_read {
+            std::thread::sleep(Duration::from_millis(1));
+            continue;
+        }
         // Volatile: the NIC writes these bytes outside the compiler's model.
         // SAFETY: in bounds of the live registered buffer.
         let landed =
@@ -295,6 +316,9 @@ fn main() -> Result<(), String> {
             return Ok(());
         }
         std::thread::sleep(Duration::from_millis(1));
+    }
+    if serve_read {
+        return Ok(());
     }
     Err("timed out waiting for a transfer".into())
 }
