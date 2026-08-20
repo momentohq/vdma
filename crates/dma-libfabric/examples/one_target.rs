@@ -11,6 +11,18 @@
 //! `--read` prefills the buffer and serves it to `read_from_peer` instead. This just holds the buffer
 //! open and lets the initiator do the verifying.
 //!
+//! `--efa` opens the `efa-direct` fabric between two EFA instances instead of tcp loopback. There the
+//! order reverses, because a target must hold the initiator's address before it can be RMA'd against
+//! and an endpoint's address is new every run — so the initiator starts first and waits on stdin:
+//!
+//! ```text
+//! # instance C — prints `local address: <initiator-hex>`, then waits
+//! cargo run -p dma-libfabric --example read_from_peer -- --efa
+//! # instance B — takes the initiator address as its only positional
+//! cargo run -p dma-libfabric --example one_target -- --efa --read <initiator-hex>
+//! # paste the target's three fields into C's stdin
+//! ```
+//!
 //! Raw libfabric: a target uses no part of this crate, which is the initiator half. The contract is
 //! `design/Client.md`.
 
@@ -20,8 +32,8 @@ use std::ptr;
 use std::time::{Duration, Instant};
 
 use dma_libfabric::sys::{
-    FI_MR_ALLOCATED, FI_MR_LOCAL, FI_MR_PROV_KEY, FI_MR_VIRT_ADDR, FI_MSG, FI_READ, FI_RECV,
-    FI_REMOTE_READ, FI_REMOTE_WRITE, FI_RMA, FI_SOURCE, FI_TRANSMIT, FI_WRITE, fi_addr_t,
+    FI_CONTEXT2, FI_MR_ALLOCATED, FI_MR_LOCAL, FI_MR_PROV_KEY, FI_MR_VIRT_ADDR, FI_MSG, FI_READ,
+    FI_RECV, FI_REMOTE_READ, FI_REMOTE_WRITE, FI_RMA, FI_SOURCE, FI_TRANSMIT, FI_WRITE, fi_addr_t,
     fi_allocinfo, fi_av_attr, fi_av_insert, fi_av_open, fi_av_type_FI_AV_MAP, fi_close, fi_cq_attr,
     fi_cq_entry, fi_cq_format_FI_CQ_FORMAT_CONTEXT, fi_cq_open, fi_cq_read, fi_domain, fi_enable,
     fi_endpoint, fi_ep_bind, fi_ep_type_FI_EP_RDM, fi_fabric, fi_freeinfo, fi_getinfo, fi_getname,
@@ -83,8 +95,11 @@ fn main() -> Result<(), String> {
         .partition(|argument| argument.starts_with("--"));
     // Serve the buffer for a remote read rather than wait for a remote write.
     let serve_read = flags.iter().any(|flag| "--read" == flag);
+    let use_efa = flags.iter().any(|flag| "--efa" == flag);
     let mut arguments = positional.into_iter();
-    let bind = arguments.next();
+    // An EFA endpoint binds to the device and advertises its own fabric address, so there is no
+    // source to pin — the first positional is the initiator's address instead.
+    let bind = if use_efa { None } else { arguments.next() };
     let initiator = arguments.next();
 
     let mut target = Target {
@@ -98,8 +113,11 @@ fn main() -> Result<(), String> {
     };
 
     // Must match the initiator's hints or the two pick incompatible providers; mirrors
-    // `endpoint::query_info`.
-    let provider = CString::new("tcp").map_err(|_| "provider name".to_string())?;
+    // `endpoint::query_info`. On efa the provider name alone is ambiguous — it exposes both rxr
+    // `efa` fabric and device-RDMA `efa-direct`.
+    let provider = CString::new(if use_efa { "efa" } else { "tcp" })
+        .map_err(|_| "provider name".to_string())?;
+    let fabric_name = CString::new("efa-direct").map_err(|_| "fabric name".to_string())?;
     let node = match &bind {
         Some(bind) => Some(CString::new(bind.as_str()).map_err(|_| "bind address".to_string())?),
         None => None,
@@ -117,6 +135,12 @@ fn main() -> Result<(), String> {
         (*(*hints).domain_attr).mr_mode =
             (FI_MR_LOCAL | FI_MR_ALLOCATED | FI_MR_PROV_KEY | FI_MR_VIRT_ADDR) as i32;
         (*(*hints).fabric_attr).prov_name = provider.as_ptr().cast_mut();
+        if use_efa {
+            (*(*hints).fabric_attr).name = fabric_name.as_ptr().cast_mut();
+            // efa-direct requires FI_CONTEXT2. This side posts no ops, but the mode has to match for
+            // fi_getinfo to hand back the right fabric.
+            (*hints).mode |= FI_CONTEXT2;
+        }
         let (node_ptr, flags) = match &node {
             Some(node) => (node.as_ptr(), FI_SOURCE),
             None => (ptr::null(), 0),
@@ -130,6 +154,7 @@ fn main() -> Result<(), String> {
             &mut target.info,
         );
         (*(*hints).fabric_attr).prov_name = ptr::null_mut();
+        (*(*hints).fabric_attr).name = ptr::null_mut();
         fi_freeinfo(hints);
         check(code, "fi_getinfo")?;
         if target.info.is_null() {

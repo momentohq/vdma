@@ -16,10 +16,11 @@ use std::sync::Arc;
 use std::sync::mpsc::{Sender, channel};
 
 use dma_libfabric::{
-    Completion, Configuration, Direction, FabricServer, Operands, Outcome, Pool, Provider,
-    TransferRequest,
+    Completion, Direction, FabricServer, Operands, Outcome, Pool, TransferRequest,
 };
-use dma_libfabric_protocol::{Advertisement, DmaError, encode_hex};
+use dma_libfabric_protocol::{DmaError, encode_hex};
+
+mod common;
 
 /// The per-op context, carried to the worker and handed back at completion.
 struct Operation {
@@ -42,12 +43,10 @@ fn complete(completions: std::vec::Drain<'_, Completion<Operation>>) {
 }
 
 fn main() -> Result<(), DmaError> {
-    let mut arguments = std::env::args().skip(1);
-    let configuration = Configuration {
-        providers: vec![Provider::Tcp],
-        bind: arguments.next(),
-        ..Configuration::default()
-    };
+    let common::Arguments {
+        configuration,
+        peer,
+    } = common::parse()?;
 
     let pool = Arc::new(Pool::new(2).map_err(|error| DmaError::Fabric(format!("pool: {error}")))?);
     let server = FabricServer::start(&configuration, Box::new(complete), pool)?;
@@ -55,17 +54,13 @@ fn main() -> Result<(), DmaError> {
     // What a peer must hold to be RMA'd against. Carry it on your own control channel.
     println!("local address: {}", encode_hex(server.local_address()));
 
-    let fields: Vec<String> = arguments.collect();
-    let [address, remote_key, remote_address] = fields.as_slice() else {
-        println!("pass <address-hex> <rkey> <remote-addr> to run a transfer");
-        return Ok(());
+    let peer = match peer {
+        Some(peer) => peer,
+        None => {
+            println!("paste the target's <address-hex> <rkey> <remote-addr>:");
+            common::peer_from_stdin()?
+        }
     };
-    let peer = Advertisement::from_fields(&[
-        address.as_bytes(),
-        remote_key.as_bytes(),
-        remote_address.as_bytes(),
-    ])
-    .map_err(|error| DmaError::Fabric(error.to_string()))?;
 
     // `one_target` waits for a full buffer of this byte.
     let payload = vec![0xab_u8; 4096];

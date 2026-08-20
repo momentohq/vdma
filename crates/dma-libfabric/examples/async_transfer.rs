@@ -10,8 +10,10 @@
 use std::sync::Arc;
 
 use dma_libfabric::asynchronous::FabricServer;
-use dma_libfabric::{Configuration, Direction, Operands, Pool, Provider, TransferRequest};
-use dma_libfabric_protocol::{Advertisement, DmaError, encode_hex};
+use dma_libfabric::{Direction, Operands, Pool, TransferRequest};
+use dma_libfabric_protocol::{DmaError, encode_hex};
+
+mod common;
 
 /// The per-op context. It owns the payload, which keeps the buffer alive for the whole
 /// transfer. Since the vec is inline it also trivially handles cancellation-safety.
@@ -30,12 +32,10 @@ impl Operands for Operation {
 /// and this crate depends on no particular runtime.
 #[tokio::main]
 async fn main() -> Result<(), DmaError> {
-    let mut arguments = std::env::args().skip(1);
-    let configuration = Configuration {
-        providers: vec![Provider::Tcp],
-        bind: arguments.next(),
-        ..Configuration::default()
-    };
+    let common::Arguments {
+        configuration,
+        peer,
+    } = common::parse()?;
 
     let pool = Arc::new(Pool::new(2).map_err(|error| DmaError::Fabric(format!("pool: {error}")))?);
     let server: FabricServer<Operation> = FabricServer::start(&configuration, pool)?;
@@ -43,17 +43,13 @@ async fn main() -> Result<(), DmaError> {
     // What a peer must hold to be RMA'd against. Carry it on your own control channel.
     println!("local address: {}", encode_hex(server.local_address()));
 
-    let fields: Vec<String> = arguments.collect();
-    let [address, remote_key, remote_address] = fields.as_slice() else {
-        println!("pass <address-hex> <rkey> <remote-addr> to run a transfer");
-        return Ok(());
+    let peer = match peer {
+        Some(peer) => peer,
+        None => {
+            println!("paste the target's <address-hex> <rkey> <remote-addr>:");
+            common::peer_from_stdin()?
+        }
     };
-    let peer = Advertisement::from_fields(&[
-        address.as_bytes(),
-        remote_key.as_bytes(),
-        remote_address.as_bytes(),
-    ])
-    .map_err(|error| DmaError::Fabric(error.to_string()))?;
 
     // `one_target` waits for a full buffer of this byte.
     let payload = vec![0xab_u8; 4096];
