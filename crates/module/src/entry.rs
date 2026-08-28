@@ -36,7 +36,13 @@ valkey_module! {
 }
 
 fn init(context: &Context, _args: &[ValkeyString]) -> Status {
-    valkey_logger::lifecycle(context, "valkey-dma module starting");
+    valkey_logger::lifecycle(
+        context,
+        &format!(
+            "valkey-dma module starting, build {}",
+            env!("VDMA_BUILD_ID")
+        ),
+    );
 
     let configuration = match load_configuration() {
         Ok(configuration) => configuration,

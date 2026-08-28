@@ -4,12 +4,13 @@
 use std::ffi::{CStr, CString};
 use std::os::raw::c_void;
 use std::ptr;
+use std::sync::Arc;
 
 use crate::sys::{
     FI_CONTEXT2, FI_EAGAIN, FI_EAVAIL, FI_MR_ALLOCATED, FI_MR_ENDPOINT, FI_MR_HMEM, FI_MR_LOCAL,
     FI_MR_PROV_KEY, FI_MR_VIRT_ADDR, FI_MSG, FI_READ, FI_RECV, FI_REMOTE_READ, FI_REMOTE_WRITE,
-    FI_RMA, FI_SOURCE, FI_TRANSMIT, FI_WRITE, fi_addr_t, fi_allocinfo, fi_av_attr, fi_av_insert,
-    fi_av_open, fi_av_remove, fi_av_type_FI_AV_MAP, fi_cq_attr, fi_cq_entry, fi_cq_err_entry,
+    FI_RMA, FI_SOURCE, FI_TRANSMIT, FI_WRITE, fi_allocinfo, fi_av_attr, fi_av_open,
+    fi_av_type_FI_AV_MAP, fi_cq_attr, fi_cq_entry, fi_cq_err_entry,
     fi_cq_format_FI_CQ_FORMAT_CONTEXT, fi_cq_open, fi_cq_read, fi_cq_readerr, fi_domain,
     fi_dupinfo, fi_enable, fi_endpoint, fi_ep_bind, fi_ep_type_FI_EP_RDM, fi_fabric, fi_freeinfo,
     fi_getinfo, fi_getname, fi_info, fi_version, fid_av, fid_cq, fid_domain, fid_ep, fid_fabric,
@@ -20,6 +21,7 @@ use crate::configuration::{Configuration, Provider};
 use crate::connection::LibfabricConnection;
 use crate::error::{check, fabric_error};
 use crate::local_regions::{LocalOperand, LocalRegions};
+use crate::peer_addresses::{PeerAddresses, RegisteredAddress};
 
 /// Guard a completion's `op_context` before the caller reclaims it as an owned allocation. A
 /// provider reporting a completion for an op we never posted would otherwise be boxed from null.
@@ -50,6 +52,8 @@ pub struct LibfabricEndpoint {
     /// Registrations covering the memory used as RMA operands, so the hot path reuses a descriptor
     /// instead of calling `fi_mr_reg` per op.
     local_regions: LocalRegions,
+    /// Address-vector entries, shared between clients advertising the same address.
+    peer_addresses: PeerAddresses,
 }
 
 /// Build the configured provider's hints and run `fi_getinfo`. The caller selects an entry from the
@@ -165,6 +169,7 @@ impl LibfabricEndpoint {
             uses_virtual_addressing: false,
             max_tx: 0,
             local_regions: LocalRegions::new(ptr::null_mut()),
+            peer_addresses: PeerAddresses::new(ptr::null_mut()),
         };
 
         let list = query_info(configuration, source_node)?;
@@ -225,6 +230,7 @@ impl LibfabricEndpoint {
                 ),
                 "fi_av_open",
             )?;
+            endpoint.peer_addresses = PeerAddresses::new(endpoint.address_vector);
 
             let mut cq_attr: fi_cq_attr = std::mem::zeroed();
             cq_attr.format = fi_cq_format_FI_CQ_FORMAT_CONTEXT;
@@ -355,35 +361,26 @@ impl LibfabricEndpoint {
     }
 
     /// Insert a peer's advertised address into the address vector once, returning a reusable handle.
-    pub fn insert_peer(&self, peer_address: &[u8]) -> Result<PeerHandle, DmaError> {
-        let mut peer: fi_addr_t = 0;
-        let inserted = unsafe {
-            fi_av_insert(
-                self.address_vector,
-                peer_address.as_ptr().cast(),
-                1,
-                &mut peer,
-                0,
-                ptr::null_mut(),
-            )
-        };
-        if inserted != 1 {
-            return Err(DmaError::Fabric(format!(
-                "fi_av_insert inserted {inserted} of 1 addresses"
-            )));
-        }
-        Ok(PeerHandle(peer))
+    pub fn insert_peer(
+        &mut self,
+        client_id: u64,
+        peer_address: &[u8],
+    ) -> Result<Arc<RegisteredAddress>, DmaError> {
+        self.peer_addresses.handle(client_id, peer_address)
     }
 
-    /// Remove a peer's address-vector entry, freeing its EFA address handle. Called on disconnect;
-    /// without it every client ever seen holds a handle for the endpoint's life, eventually
-    /// pressuring the device into flushing queue pairs.
-    pub fn remove_peer(&self, peer: PeerHandle) -> Result<(), DmaError> {
-        let mut address = peer.0;
-        check(
-            unsafe { fi_av_remove(self.address_vector, &mut address, 1, 0) },
-            "fi_av_remove",
-        )
+    /// Let go of a disconnected client's address-vector entry. It leaves the vector only once every
+    /// client advertising that address has gone — see [`crate::peer_addresses`] for why removing it
+    /// per client destroys the entry the others are still posting against.
+    pub fn release_peer(&mut self, client_id: u64) {
+        self.peer_addresses.release(client_id);
+    }
+
+    /// The address vector its entries live in. Only for tests that run [`PeerAddresses`] against
+    /// a real vector.
+    #[cfg(test)]
+    pub(crate) fn address_vector(&self) -> *mut fid_av {
+        self.address_vector
     }
 
     /// The local descriptor covering an RMA operand. A null descriptor and no registration for tcp
@@ -396,7 +393,7 @@ impl LibfabricEndpoint {
         if !self.requires_local_mr {
             return Ok(LocalOperand {
                 descriptor: ptr::null_mut(),
-                registration: None,
+                lease: None,
             });
         }
         self.local_regions.operand(pointer, length)
@@ -407,11 +404,11 @@ impl LibfabricEndpoint {
     /// no fabric calls, so a session can rebuild one per command.
     pub fn connection(
         &self,
-        peer: PeerHandle,
+        peer: &RegisteredAddress,
         remote_key: u64,
         remote_address: u64,
     ) -> LibfabricConnection<'_> {
-        LibfabricConnection::new(self.endpoint, peer.0, remote_key, remote_address)
+        LibfabricConnection::new(self.endpoint, peer.handle(), remote_key, remote_address)
     }
 
     /// A snapshot of the selected provider's attributes, for `DMA.INFO`.
@@ -498,16 +495,15 @@ fn decode_caps(caps: u64) -> String {
         .join("|")
 }
 
-/// An inserted peer's address-vector handle, reusable across operations.
-#[derive(Debug, Clone, Copy)]
-pub struct PeerHandle(fi_addr_t);
-
 impl Drop for LibfabricEndpoint {
     fn drop(&mut self) {
         use crate::sys::fi_close;
         // The local memory regions are domain objects, so they must close before the domain. The
         // worker has joined, so no in-flight op still holds an Rc clone.
         self.local_regions.clear();
+        // Each entry removes itself from the address vector when its last holder drops, so they all
+        // have to go before that vector is closed below.
+        self.peer_addresses.clear();
         unsafe {
             if !self.endpoint.is_null() {
                 fi_close(&mut (*self.endpoint).fid);

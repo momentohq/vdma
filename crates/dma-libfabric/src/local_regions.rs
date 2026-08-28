@@ -12,35 +12,21 @@
 
 use std::os::raw::c_void;
 use std::ptr;
+use std::sync::Arc;
 
-use crate::sys::{FI_READ, FI_WRITE, fi_close, fi_mr_desc, fi_mr_reg, fid_domain, fid_mr};
+use crate::sys::{FI_READ, FI_WRITE, fi_mr_desc, fi_mr_reg, fid_domain, fid_mr};
 use dma_libfabric_protocol::DmaError;
 
 use crate::error::check;
-use crate::region_cache;
+use crate::region_cache::{self, Registration};
 
-/// A local RMA operand's descriptor, plus the registration when this operation owns it.
+/// A local RMA operand's descriptor and the lease keeping its registration alive.
 #[derive(Debug)]
 pub(crate) struct LocalOperand {
     pub(crate) descriptor: *mut c_void,
-    /// `Some` when this extent isn't cacheable. Held for the operation and closed on completion.
-    /// `None` when [`crate::region_cache`] owns the registration.
-    pub(crate) registration: Option<OperandRegistration>,
-}
-
-/// A registration belonging to one operation.
-#[derive(Debug)]
-pub(crate) struct OperandRegistration(*mut fid_mr);
-
-// SAFETY: travels to the fabric worker with its op and is closed there, never used concurrently —
-// which is all libfabric requires of an object crossing threads.
-unsafe impl Send for OperandRegistration {}
-
-impl Drop for OperandRegistration {
-    fn drop(&mut self) {
-        // SAFETY: the op has completed, so nothing holds this descriptor; closed once.
-        unsafe { fi_close(&mut (*self.0).fid) };
-    }
+    /// `None` only on providers that need no local registration at all, where the descriptor is
+    /// null and there is nothing to hold open.
+    pub(crate) lease: Option<Arc<Registration>>,
 }
 
 /// Per-endpoint handle for the operand-registration path, deferring registration lifetime to
@@ -70,29 +56,40 @@ impl LocalRegions {
             .ok_or_else(|| DmaError::Fabric("local operand range overflows".into()))?;
 
         let domain = self.domain as usize;
-        if let Some(memory_region) = region_cache::covering(start, end, domain) {
-            // SAFETY: still tracked, so not yet deregistered, and the operand is live.
+        if let Some(lease) = region_cache::covering(start, end, domain) {
+            // SAFETY: the lease holds the region open for as long as this operand lives, so the
+            //         descriptor cannot be deregistered underneath the transfer that posts it.
+            let descriptor = unsafe { fi_mr_desc(lease.memory_region()) };
             return Ok(LocalOperand {
-                descriptor: unsafe { fi_mr_desc(memory_region) },
-                registration: None,
+                descriptor,
+                lease: Some(lease),
             });
         }
 
         // done before registering so notifier coverage doesn't lag the registration it reclaims
         let cacheable = region_cache::will_track(pointer, length);
-        let memory_region = self.register(pointer, length)?;
-        // SAFETY: freshly registered above.
-        let descriptor = unsafe { fi_mr_desc(memory_region) };
-        if !cacheable {
-            return Ok(LocalOperand {
-                descriptor,
-                registration: Some(OperandRegistration(memory_region)),
-            });
+        // Register the containing extent when the notifier supports it, so the next operand landing
+        // nearby reuses this registration instead of taking its own.
+        let (base, limit) = region_cache::extent_for(pointer, length);
+        // If a widened registration fails, take the operand's extent instead
+        let region = match self.register(base as *mut u8, limit - base) {
+            Ok(region) => Ok((base, limit, region)),
+            Err(_) if (base, limit) != (start, end) => self
+                .register(pointer, length)
+                .map(|region| (start, end, region)),
+            Err(error) => Err(error),
+        };
+        let (base, limit, region) = region?;
+        let lease = Registration::new(region);
+        // SAFETY: freshly registered above, and held by `lease`.
+        let descriptor = unsafe { fi_mr_desc(lease.memory_region()) };
+        if cacheable {
+            // The registry takes its own lease; this operand keeps the one it already holds.
+            region_cache::track(base, limit, domain, &lease);
         }
-        region_cache::track(start, end, domain, memory_region);
         Ok(LocalOperand {
             descriptor,
-            registration: None,
+            lease: Some(lease),
         })
     }
 

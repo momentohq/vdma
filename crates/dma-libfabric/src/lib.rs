@@ -15,6 +15,7 @@ mod endpoint;
 mod error;
 mod local_regions;
 mod operands;
+mod peer_addresses;
 mod pool;
 mod region_cache;
 mod server;
@@ -24,8 +25,9 @@ pub mod sys;
 
 pub use configuration::{Configuration, Provider};
 pub use devices::discover_domains;
-pub use endpoint::{EndpointInfo, LibfabricEndpoint, PeerHandle};
+pub use endpoint::{EndpointInfo, LibfabricEndpoint};
 pub use operands::Operands;
+pub use peer_addresses::RegisteredAddress;
 pub use pool::Pool;
 pub use region_cache::{ReclaimNotifier, install_reclaim_notifier, invalidate};
 pub use server::{

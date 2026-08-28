@@ -19,21 +19,16 @@ use crate::Direction;
 use crate::Operands;
 use crate::TransferDone;
 use crate::TransferRequest;
-use crate::endpoint::{LibfabricEndpoint, PeerHandle};
+use crate::endpoint::LibfabricEndpoint;
 use crate::error::fabric_error;
-use crate::local_regions::{LocalOperand, OperandRegistration};
+use crate::local_regions::LocalOperand;
 use crate::pool::Pool;
+use crate::region_cache::Registration;
 use crate::server::WorkerMessage;
 
 /// Completions to reap in one pass, and the batch size that triggers a flush — bounding what one
 /// batch, and so one downstream lock acquisition, accumulates.
 const TARGET_COMPLETIONS: usize = 10;
-
-/// A client's address-vector entry, kept so we don't re-insert per request.
-pub struct CachedPeer {
-    address: Vec<u8>,
-    peer: PeerHandle,
-}
 
 pub fn worker_main<T: Operands + Send + 'static>(
     configuration: Configuration,
@@ -62,7 +57,6 @@ pub fn worker_main<T: Operands + Send + 'static>(
 
     let cap = in_flight_cap(&endpoint, configuration.max_in_flight);
     let again = -(FI_EAGAIN as isize);
-    let mut peers: HashMap<u64, CachedPeer> = HashMap::new();
     // Outstanding (queued or in-flight) ops per client, and clients whose peer to remove once that
     // count hits 0. Counting from intake rather than posting stops a removal slipping between a
     // queued transfer and its post, where the post would re-insert the peer just removed. Deferring
@@ -92,8 +86,7 @@ pub fn worker_main<T: Operands + Send + 'static>(
                     &mut completions,
                 ),
                 Ok(WorkerMessage::RemovePeer(client_id)) => remove_or_defer(
-                    &endpoint,
-                    &mut peers,
+                    &mut endpoint,
                     &outstanding_by_client,
                     &mut pending_removal,
                     client_id,
@@ -112,7 +105,7 @@ pub fn worker_main<T: Operands + Send + 'static>(
             let Some(prepared) = pending.pop_front() else {
                 break;
             };
-            let error = match post(&mut endpoint, &mut peers, &prepared) {
+            let error = match post(&mut endpoint, &prepared) {
                 Ok(0) => {
                     in_flight += 1;
                     posted += 1;
@@ -129,8 +122,7 @@ pub fn worker_main<T: Operands + Send + 'static>(
             let client_id = prepared.client_id;
             completions.push(reclaim(prepared.context).into_completion(Err(error)));
             finish_op(
-                &endpoint,
-                &mut peers,
+                &mut endpoint,
                 &mut outstanding_by_client,
                 &mut pending_removal,
                 outstanding,
@@ -165,8 +157,7 @@ pub fn worker_main<T: Operands + Send + 'static>(
         for (context, result) in reaped.drain(..) {
             let inflight = reclaim(context.cast::<InFlight<T>>());
             finish_op(
-                &endpoint,
-                &mut peers,
+                &mut endpoint,
                 &mut outstanding_by_client,
                 &mut pending_removal,
                 outstanding,
@@ -216,8 +207,7 @@ pub fn worker_main<T: Operands + Send + 'static>(
                 ),
                 // Nothing is outstanding here, so this client has no ops to drain: remove now.
                 Ok(WorkerMessage::RemovePeer(client_id)) => remove_or_defer(
-                    &endpoint,
-                    &mut peers,
+                    &mut endpoint,
                     &outstanding_by_client,
                     &mut pending_removal,
                     client_id,
@@ -299,14 +289,13 @@ fn accept<T: Operands>(
 /// Remove a disconnected client's peer, or defer until its last op finishes. Removing with ops
 /// outstanding would flush the queue pair, and a queued transfer would re-insert the peer.
 fn remove_or_defer(
-    endpoint: &LibfabricEndpoint,
-    peers: &mut HashMap<u64, CachedPeer>,
+    endpoint: &mut LibfabricEndpoint,
     outstanding_by_client: &HashMap<u64, usize>,
     pending_removal: &mut HashSet<u64>,
     client_id: u64,
 ) {
     if 0 == outstanding_by_client.get(&client_id).copied().unwrap_or(0) {
-        drop_peer(endpoint, peers, client_id);
+        endpoint.release_peer(client_id);
     } else {
         pending_removal.insert(client_id);
     }
@@ -315,8 +304,7 @@ fn remove_or_defer(
 /// Account one finished op, reaped or failed to post, against its client, performing a deferred peer
 /// removal when its last op drains.
 fn finish_op(
-    endpoint: &LibfabricEndpoint,
-    peers: &mut HashMap<u64, CachedPeer>,
+    endpoint: &mut LibfabricEndpoint,
     outstanding_by_client: &mut HashMap<u64, usize>,
     pending_removal: &mut HashSet<u64>,
     outstanding: &AtomicUsize,
@@ -333,7 +321,7 @@ fn finish_op(
     if 0 == remaining {
         outstanding_by_client.remove(&client_id);
         if pending_removal.remove(&client_id) {
-            drop_peer(endpoint, peers, client_id);
+            endpoint.release_peer(client_id);
         }
     }
 }
@@ -344,15 +332,6 @@ fn release_outstanding(outstanding: &AtomicUsize) {
     let _ = outstanding.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
         Some(current.saturating_sub(1))
     });
-}
-
-/// Remove a client's address-vector entry and forget its cached handle. No-op if it never had one.
-fn drop_peer(endpoint: &LibfabricEndpoint, peers: &mut HashMap<u64, CachedPeer>, client_id: u64) {
-    if let Some(cached) = peers.remove(&client_id)
-        && let Err(error) = endpoint.remove_peer(cached.peer)
-    {
-        tracing::warn!("fi_av_remove failed for disconnected client {client_id}: {error}");
-    }
 }
 
 /// A reaped op awaiting its checksummed completion on the pool.
@@ -367,19 +346,12 @@ fn reclaim<T>(context: *mut InFlight<T>) -> Box<InFlight<T>> {
 
 /// Post one prepared transfer, returning the raw libfabric code (`0` posted, `-FI_EAGAIN` transmit
 /// queue full, else error), or `Err` for a setup failure: peer insert or region registration.
-fn post<T>(
-    endpoint: &mut LibfabricEndpoint,
-    peers: &mut HashMap<u64, CachedPeer>,
-    prepared: &Prepared<T>,
-) -> Result<isize, DmaError> {
-    let peer = peer_handle(endpoint, peers, prepared.client_id, &prepared.peer_address)?;
+fn post<T>(endpoint: &mut LibfabricEndpoint, prepared: &Prepared<T>) -> Result<isize, DmaError> {
+    let peer = endpoint.insert_peer(prepared.client_id, &prepared.peer_address)?;
     let context = prepared.context.cast::<c_void>();
     let length = prepared.length;
-    let LocalOperand {
-        descriptor,
-        registration,
-    } = endpoint.local_operand(prepared.pointer, length)?;
-    let connection = endpoint.connection(peer, prepared.remote_key, prepared.remote_address);
+    let LocalOperand { descriptor, lease } = endpoint.local_operand(prepared.pointer, length)?;
+    let connection = endpoint.connection(&peer, prepared.remote_key, prepared.remote_address);
     // On-wire time, as an explicit child of the caller's `dma.get`/`dma.set` span so the transfer
     // tree covers setup -> wire -> completion without entering the parent on this thread. Stored in
     // the operation, so it stays open until completion.
@@ -414,8 +386,10 @@ fn post<T>(
         unsafe {
             (*prepared.context).wire_span = wire;
             (*prepared.context).await_span = await_completion;
-            // Held until the completion drops the operation.
-            (*prepared.context).local_registration = registration;
+            // Held until the completion drops the operation: while this lease lives the region
+            // cannot be deregistered, so a concurrent reclaim cannot pull it out from under the
+            // descriptor this post just handed to libfabric.
+            (*prepared.context).local_lease = lease;
         }
     }
     Ok(code)
@@ -433,31 +407,6 @@ fn in_flight_cap(endpoint: &LibfabricEndpoint, configured: Option<usize>) -> usi
         0 => requested,
         hardware => requested.min(hardware),
     }
-}
-
-/// The cached `fi_addr_t` for this client, inserting or refreshing it as needed.
-fn peer_handle(
-    endpoint: &LibfabricEndpoint,
-    peers: &mut HashMap<u64, CachedPeer>,
-    client_id: u64,
-    address: &[u8],
-) -> Result<PeerHandle, DmaError> {
-    if let Some(cached) = peers.get(&client_id) {
-        if cached.address == address {
-            return Ok(cached.peer);
-        }
-        // Drop the stale entry first, so a re-advertised address doesn't leak the old handle.
-        let _ = endpoint.remove_peer(cached.peer);
-    }
-    let peer = endpoint.insert_peer(address)?;
-    peers.insert(
-        client_id,
-        CachedPeer {
-            address: address.to_vec(),
-            peer,
-        },
-    );
-    Ok(peer)
 }
 
 /// Per-op state. Its pointer is the `op_context` handed to libfabric and recovered on completion.
@@ -479,9 +428,11 @@ struct InFlight<T> {
     want_checksum: bool,
     /// The local operand: the source for `ToPeer`, the landing buffer for `FromPeer`.
     buffer_pointer: *mut u8,
-    /// The operand's registration under `RegionMode::PerOperation`, closed when this op is reaped
-    /// and its `InFlight` dropped. `None` when the registry owns it.
-    local_registration: Option<OperandRegistration>,
+    /// The operand's lease on its registration, held from post until this op is reaped and its
+    /// `InFlight` dropped. An uncached extent is deregistered right there, being its only holder; a
+    /// cached one only if a reclaim already retired it from the registry. `None` until posted, and
+    /// on providers needing no local registration.
+    local_lease: Option<Arc<Registration>>,
     /// Post to reap: the on-wire duration. `Span::none()` until posted, and when tracing is off.
     wire_span: tracing::Span,
     /// Child of `wire_span` covering only the wait, from `fi_*` returning to the completion reaped.
@@ -554,7 +505,7 @@ fn prepare<T: Operands>(request: TransferRequest<T>) -> Result<Prepared<T>, Comp
         buffer_pointer: std::ptr::null_mut(),
         want_checksum: request.want_checksum,
         // Set at post time, once the operand is registered.
-        local_registration: None,
+        local_lease: None,
         wire_span: tracing::Span::none(),
         await_span: tracing::Span::none(),
     });
