@@ -22,6 +22,7 @@ use crate::TransferRequest;
 use crate::endpoint::LibfabricEndpoint;
 use crate::error::fabric_error;
 use crate::local_regions::LocalOperand;
+use crate::operands::CacheableSpan;
 use crate::pool::Pool;
 use crate::region_cache::Registration;
 use crate::server::WorkerMessage;
@@ -91,6 +92,14 @@ pub fn worker_main<T: Operands + Send + 'static>(
                     &mut pending_removal,
                     client_id,
                 ),
+                // The submitter is blocked on this reply, so answer even when the pin fails.
+                Ok(WorkerMessage::Register {
+                    base,
+                    length,
+                    reply,
+                }) => {
+                    let _ = reply.send(endpoint.pin_region(base, length));
+                }
                 Err(TryRecvError::Empty) => break,
                 Err(TryRecvError::Disconnected) => {
                     disconnected = true;
@@ -212,6 +221,13 @@ pub fn worker_main<T: Operands + Send + 'static>(
                     &mut pending_removal,
                     client_id,
                 ),
+                Ok(WorkerMessage::Register {
+                    base,
+                    length,
+                    reply,
+                }) => {
+                    let _ = reply.send(endpoint.pin_region(base, length));
+                }
                 Err(_) => break, // channel closed and nothing left → shutdown
             }
         } else if 0 == posted && !reaped_any {
@@ -350,7 +366,8 @@ fn post<T>(endpoint: &mut LibfabricEndpoint, prepared: &Prepared<T>) -> Result<i
     let peer = endpoint.insert_peer(prepared.client_id, &prepared.peer_address)?;
     let context = prepared.context.cast::<c_void>();
     let length = prepared.length;
-    let LocalOperand { descriptor, lease } = endpoint.local_operand(prepared.pointer, length)?;
+    let LocalOperand { descriptor, lease } =
+        endpoint.local_operand(prepared.pointer, length, prepared.cacheable_span)?;
     let connection = endpoint.connection(&peer, prepared.remote_key, prepared.remote_address);
     // On-wire time, as an explicit child of the caller's `dma.get`/`dma.set` span so the transfer
     // tree covers setup -> wire -> completion without entering the parent on this thread. Stored in
@@ -486,6 +503,8 @@ struct Prepared<T> {
     /// The resolved local operand pointer must stay valid for the post.
     pointer: *mut u8,
     length: usize,
+    /// The caller's span for this operand
+    cacheable_span: Option<CacheableSpan>,
     direction: Direction,
     /// The caller's transfer span, parent of the on-wire span.
     parent_id: Option<tracing::span::Id>,
@@ -539,6 +558,7 @@ fn prepare<T: Operands>(request: TransferRequest<T>) -> Result<Prepared<T>, Comp
     };
     inflight.buffer_pointer = pointer;
     inflight.length = length;
+    let cacheable_span = inflight.caller_context.cacheable_span();
     Ok(Prepared {
         context: Box::into_raw(inflight),
         client_id: request.client_id,
@@ -547,6 +567,7 @@ fn prepare<T: Operands>(request: TransferRequest<T>) -> Result<Prepared<T>, Comp
         remote_address: request.remote_address,
         pointer,
         length,
+        cacheable_span,
         direction: request.direction,
         parent_id: request.parent_id,
     })

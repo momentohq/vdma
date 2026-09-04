@@ -14,8 +14,8 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 
 use dma_libfabric::{
-    Completion, Configuration as FabricConfiguration, Direction, FabricServer, Operands, Outcome,
-    Pool, Provider, TransferDone, TransferRequest,
+    CacheableSpan, Completion, Configuration as FabricConfiguration, Direction, FabricServer,
+    Operands, Outcome, Pool, Provider, TransferDone, TransferRequest,
 };
 use dma_libfabric_protocol::{Advertisement, DmaError, encode_hex};
 use valkey_module::{
@@ -26,7 +26,7 @@ use linkme::distributed_slice;
 use valkey_module::server_events::{CLIENT_CHANGED_SERVER_EVENTS_LIST, ClientChangeSubevent};
 
 use crate::valkey_error::command_error;
-use crate::{static_state, valkey_logger};
+use crate::{memory, static_state, valkey_logger};
 
 /// The per-op token carried to the worker and back, holding the valkey handles needed to finish the
 /// transfer. They are dereferenced only under the GIL, in [`finish_under_gil`].
@@ -81,6 +81,24 @@ impl Operands for OpToken {
             }
             OpToken::Get { .. } => None,
         }
+    }
+
+    /// The operand's own extent, cacheable once its arena is hooked — [`memory::ensure_covered`]
+    /// hooks it here, before the registration it has to cover is taken, and answers `false` when it
+    /// cannot, which registers this transfer's operand and closes it at completion.
+    ///
+    /// Not widened to the jemalloc extent, which would let neighbouring values share one
+    /// registration. That is safe — a retired entry stays open under an in-flight lease — but
+    /// `invalidate` retires by overlap, so freeing any one value in the extent costs every other
+    /// value in it a fresh `fi_mr_reg`.
+    fn cacheable_span(&self) -> Option<CacheableSpan> {
+        let bytes = match self {
+            OpToken::Get { held, .. } => held.as_bytes(),
+            OpToken::Set { destination, .. } => destination.as_ref()?.as_slice(),
+        };
+        let pointer = bytes.as_ptr().cast_mut();
+        memory::ensure_covered(pointer)
+            .then(|| CacheableSpan::new(pointer as usize, bytes.len()))?
     }
 }
 

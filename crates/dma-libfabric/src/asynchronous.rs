@@ -1,4 +1,4 @@
-//! `await` a transfer instead of writing a [`BatchCompleter`].
+//! `await` a transfer instead of writing a [`crate::BatchCompleter`].
 //!
 //! A [`Transfer`] is a [`Future`] any executor can poll. See `examples/async_transfer.rs`, which
 //! drives one on a `Condvar`.

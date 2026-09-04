@@ -9,8 +9,8 @@
 //! ```
 //!
 //! The peer is passive: it registers the buffer and hands you those fields over a control channel
-//! this crate knows nothing about. Registration caching is off here — no `ReclaimNotifier` is
-//! installed, so each operand is registered and closed per transfer.
+//! this crate knows nothing about. Registration caching is off here — the context answers no
+//! `CacheableSpan`, so each operand is registered and closed per transfer.
 
 use std::sync::Arc;
 use std::sync::mpsc::{Sender, channel};

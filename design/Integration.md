@@ -130,31 +130,60 @@ back. The worker holds your context, so bytes your context owns are expected to 
 write them until completion.
 
 EFA requires `FI_MR_LOCAL`. Every local operand must be registered, and `fi_mr_reg` costs time.
-`dma-libfabric` therefore optionally caches registrations, but the cache requires you to install a
-`ReclaimNotifier`. A registration pins the physical pages present when it was taken and goes stale
-when your allocator reclaims them. That may be jemalloc, or it may be a custom memory pool, or some
-other thing.
+`dma-libfabric` therefore optionally caches registrations. There are two ways to opt in, depending on
+whether you own the memory.
+
+## Memory you own
+
+`FabricServer::register` takes your storage and pins it on that server's domain, handing back a
+`MemoryRegion<S>`:
 
 ```rust
-pub trait ReclaimNotifier: Send + Sync {
-    fn covers(&self, pointer: *mut u8, length: usize) -> bool;
+let region = server.register(vec![0u8; 64 * 1024 * 1024])?;
+```
+
+Every operand inside the span is then a cache hit with no `fi_mr_reg` at all. Hold a clone of the
+`MemoryRegion` in the context of any transfer whose operand lives there — that is what keeps the
+storage mapped for the transfer. Dropping the last clone deregisters, then frees, in that order.
+
+Registering the same storage on several servers pins it once per device against `RLIMIT_MEMLOCK`, so
+prefer one region per device and route its traffic to that server. See
+`examples/registered_arena.rs`.
+
+## Memory your allocator owns
+
+A registration pins the physical pages present when it was taken and goes stale when your allocator
+reclaims them. That may be jemalloc, or a custom memory pool, or some other thing. Answer a
+`CacheableSpan` from your context to say a registration over it may be kept:
+
+```rust
+impl Operands for MyContext {
+    fn cacheable_span(&self) -> Option<CacheableSpan> {
+        CacheableSpan::new(self.base, self.length)
+    }
 }
 ```
 
-`covers` is asked once per cache miss, before the extent is registered: answer `false` for any pointer
-you can't guarantee will result in an `invalidate()` call, and that operand safely falls back to a
-per-operation registration. In exchange for returning true, you promise to call
-`dma_libfabric::invalidate(start, end)` over this range before its pages are reclaimed or moved. Note
-that reusing or rewriting the memory is fine. So if you have a buffer pool you reuse, you don't have to
+It is asked once per cache miss, on the worker and after the operand resolves, so a landing buffer
+your `allocate` just produced can answer for itself. Return `None` for any operand you can't
+guarantee will result in an `invalidate()` call, and it safely falls back to a per-operation
+registration. In exchange for returning `Some`, you promise to call
+`dma_libfabric::invalidate(start, end)` over that span before its pages are reclaimed or moved.
+
+The span may be wider than the operand, and widening it is the point: a span covering a whole
+allocator extent lets every operand landing in it share one registration. It must contain the
+operand — one that doesn't is ignored, since registering it would pin the wrong memory. Note that
+reusing or rewriting the memory is fine. So if you have a buffer pool you reuse, you don't have to
 invalidate when you rewrite something in the buffer. You only need to invalidate if you are going to
 resize/reallocate the buffer or free it. This also means you _could_ use a fixed buffer pool strategy
-and just trivially return true forever and never call invalidate.
+and just trivially answer a span forever and never call invalidate.
 
-Install a ReclaimNotifier once at startup, before any transfer. If you skip it, everything still works.
-Each local operand is registered and closed per transfer, which is still correct but probably slower.
+If you answer `None` everywhere, everything still works. Each local operand is registered and closed
+per transfer, which is still correct but probably slower.
 
-The vdma module implements this with jemalloc extent hooks. An `munmap` interposer or a slab
-allocator with a free callback would do the same thing.
+The vdma module implements this with jemalloc extent hooks, hooking the arena backing an operand
+before answering for it. An `munmap` interposer or a slab allocator with a free callback would do the
+same thing.
 
 # Providers
 

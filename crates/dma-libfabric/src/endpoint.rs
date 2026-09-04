@@ -21,6 +21,7 @@ use crate::configuration::{Configuration, Provider};
 use crate::connection::LibfabricConnection;
 use crate::error::{check, fabric_error};
 use crate::local_regions::{LocalOperand, LocalRegions};
+use crate::operands::CacheableSpan;
 use crate::peer_addresses::{PeerAddresses, RegisteredAddress};
 
 /// Guard a completion's `op_context` before the caller reclaims it as an owned allocation. A
@@ -370,8 +371,7 @@ impl LibfabricEndpoint {
     }
 
     /// Let go of a disconnected client's address-vector entry. It leaves the vector only once every
-    /// client advertising that address has gone — see [`crate::peer_addresses`] for why removing it
-    /// per client destroys the entry the others are still posting against.
+    /// client advertising that address has gone.
     pub fn release_peer(&mut self, client_id: u64) {
         self.peer_addresses.release(client_id);
     }
@@ -383,12 +383,22 @@ impl LibfabricEndpoint {
         self.address_vector
     }
 
+    /// Register a caller-owned span on this endpoint's domain so operands inside it cost no
+    /// `fi_mr_reg`. A provider needing no local registration has nothing to pin.
+    pub(crate) fn pin_region(&mut self, base: usize, length: usize) -> Result<(), DmaError> {
+        if !self.requires_local_mr {
+            return Ok(());
+        }
+        self.local_regions.pin(base, length)
+    }
+
     /// The local descriptor covering an RMA operand. A null descriptor and no registration for tcp
     /// and other providers needing no local registration.
     pub(crate) fn local_operand(
         &mut self,
         pointer: *mut u8,
         length: usize,
+        cacheable: Option<CacheableSpan>,
     ) -> Result<LocalOperand, DmaError> {
         if !self.requires_local_mr {
             return Ok(LocalOperand {
@@ -396,7 +406,7 @@ impl LibfabricEndpoint {
                 lease: None,
             });
         }
-        self.local_regions.operand(pointer, length)
+        self.local_regions.operand(pointer, length, cacheable)
     }
 
     /// Build a connection to an inserted peer. `remote_address` is the peer buffer's virtual address

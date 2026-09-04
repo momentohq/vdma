@@ -12,8 +12,7 @@
 //! so deregistration cannot race an in-flight descriptor.
 
 use std::os::raw::c_void;
-
-use dma_libfabric::ReclaimNotifier;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::memory::{huge_arena, jemalloc};
 
@@ -97,12 +96,12 @@ pub struct RegionHooksReport {
     pub huge_arena_oversize_threshold: usize,
 }
 
-/// Registers the wrapped hooks with `dma-libfabric` as its reclaim notifier and tunes the huge
-/// arena. Call once at startup.
+/// Capture jemalloc's default hooks, arm [`ensure_covered`], and tune the huge arena. Call once at
+/// startup.
 ///
-/// Arenas are hooked lazily, on the registration path ([`JemallocRegions::covers`]), so an operand
-/// cannot be registered in an unhooked arena and no startup scan is needed. Tuning must happen here
-/// — see [`huge_arena`] for what jemalloc's defaults would otherwise cost.
+/// Arenas are hooked lazily, on the registration path ([`ensure_covered`]), so an operand cannot be
+/// registered in an unhooked arena and no startup scan is needed. Tuning must happen here — see
+/// [`huge_arena`] for what jemalloc's defaults would otherwise cost.
 pub fn install(
     huge_arena_decay_ms: i64,
     huge_arena_oversize_threshold: usize,
@@ -129,7 +128,7 @@ pub fn install(
 
     let huge_arena = huge_arena::tune(huge_arena_decay_ms, huge_arena_oversize_threshold);
 
-    dma_libfabric::install_reclaim_notifier(&JemallocRegions);
+    ARMED.store(true, Ordering::Release);
     RegionHooksReport {
         mode: RegionMode::Cached,
         huge_arena,
@@ -138,19 +137,21 @@ pub fn install(
     }
 }
 
-/// The promise `dma-libfabric` caches registrations against: any page of a hooked arena is reported
-/// before it is reclaimed.
-struct JemallocRegions;
+/// Whether [`install`] captured jemalloc's defaults. Until it has, [`WRAPPED`] would chain to
+/// nothing, so no arena may be hooked and nothing may be cached.
+static ARMED: AtomicBool = AtomicBool::new(false);
 
-impl ReclaimNotifier for JemallocRegions {
-    /// Hook the arena backing this operand if it isn't already, and say whether it is now covered.
-    /// jemalloc creates arenas lazily as threads bind to them, and an unhooked one holding a
-    /// registered operand would skip deregistration on free and leave the registration stale. Called
-    /// before the operand is registered, so coverage cannot lag the registration. The
-    /// `arena.<i>.extent_hooks` write is idempotent.
-    fn covers(&self, pointer: *mut u8, _length: usize) -> bool {
-        jemalloc::arena_of(pointer.cast::<c_void>()).is_some_and(write_extent_hooks)
-    }
+/// Hook the arena backing this operand if it isn't already, and say whether it is now covered.
+///
+/// This is what makes a [`dma_libfabric::CacheableSpan`] over `pointer` honest: only a hooked arena
+/// reports its pages to [`dma_libfabric::invalidate`] before reclaiming them. jemalloc creates
+/// arenas lazily as threads bind to them, and an unhooked one holding a registered operand would
+/// skip deregistration on free and leave the registration stale. Called before the operand is
+/// registered, so coverage cannot lag the registration. The `arena.<i>.extent_hooks` write is
+/// idempotent.
+pub fn ensure_covered(pointer: *mut u8) -> bool {
+    ARMED.load(Ordering::Acquire)
+        && jemalloc::arena_of(pointer.cast::<c_void>()).is_some_and(write_extent_hooks)
 }
 
 unsafe extern "C" fn wrapped_dalloc(

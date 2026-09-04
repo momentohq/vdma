@@ -17,6 +17,7 @@ use std::thread::JoinHandle;
 use dma_libfabric_protocol::DmaError;
 
 use crate::configuration::Configuration;
+use crate::memory_region::MemoryRegion;
 use crate::operands::Operands;
 use crate::pool::Pool;
 
@@ -75,6 +76,13 @@ pub enum WorkerMessage<TContext> {
     Transfer(TransferRequest<TContext>),
     /// Remove this disconnected client's peer once its in-flight transfers have drained.
     RemovePeer(u64),
+    /// Register a caller-owned span on this worker's domain, answering on `reply`. This keeps
+    /// domain calls on the worker thread who owns it.
+    Register {
+        base: usize,
+        length: usize,
+        reply: Sender<Result<(), DmaError>>,
+    },
 }
 
 /// A sideband an rpc server uses to implement data-transfer commands over a faster transport. It
@@ -190,6 +198,48 @@ impl<TContext: Send + 'static> FabricServer<TContext> {
                 };
                 request
             })
+    }
+
+    /// Register `storage`, blocking until it is resident.
+    ///
+    /// Transfers submitted to this server whose operands live in `storage` skip `fi_mr_reg`.
+    /// Submitting them to a different server still works. However that server's domain has no
+    /// registration covering them, so it takes one per operation. It's slower that way.
+    ///
+    /// Registering the same storage on several servers pins the span once per device against
+    /// `RLIMIT_MEMLOCK`, so prefer one region per device and route its traffic to that server.
+    pub fn register<S>(&self, storage: S) -> Result<MemoryRegion<S>, DmaError>
+    where
+        S: AsRef<[u8]> + Send + Sync + 'static,
+    {
+        // Boxed before the span is taken. We're playing with pointers so memory position is
+        // relevant, and has to stay fixed.
+        let storage = Box::new(storage);
+        let bytes: &[u8] = (*storage).as_ref();
+        let (base, length) = (bytes.as_ptr() as usize, bytes.len());
+        if 0 == length {
+            return Err(DmaError::Fabric("cannot register 0 bytes".into()));
+        }
+        let end = base
+            .checked_add(length)
+            .ok_or_else(|| DmaError::Fabric("registered region range overflows".into()))?;
+
+        let sender = self
+            .sender
+            .as_ref()
+            .ok_or_else(|| DmaError::Fabric("fabric worker is gone".into()))?;
+        let (reply, answer) = channel();
+        sender
+            .send(WorkerMessage::Register {
+                base,
+                length,
+                reply,
+            })
+            .map_err(|_| DmaError::Fabric("fabric worker is gone".into()))?;
+        answer
+            .recv()
+            .map_err(|_| DmaError::Fabric("fabric worker exited before registering".into()))??;
+        Ok(MemoryRegion::new(storage, base, end))
     }
 
     /// Ask the worker to drop a disconnected client's address-vector entry once its in-flight

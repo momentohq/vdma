@@ -1,15 +1,15 @@
 //! A process-global cache of fi_mr_reg operand registrations
 //!
 //! A registration pins physical pages when it was taken. It goes stale when those pages are
-//! `madvise`d away, decommitted, or unmapped. The [`ReclaimNotifier`]  drives [`invalidate`]
-//! of pages before they go stale.
+//! `madvise`d away, decommitted, or unmapped. Whoever reclaims those pages calls [`invalidate`]
+//! before they go stale.
 //!
 //! Entries are grouped by domain. Reclaim, by contrast, deregisters across  every domain.
 //!
 //! Registrations are local `FI_READ | FI_WRITE`.
 
 use std::collections::BTreeMap;
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex};
 
 use crate::sys::{fi_close, fid_mr};
 
@@ -60,58 +60,6 @@ impl Drop for Registration {
     }
 }
 
-/// Your promise that you will call [`invalidate`] over any range whose pages you are about to
-/// be reclaim. Required for `fi_mr_reg` caching.
-pub trait ReclaimNotifier: Send + Sync {
-    /// Can this notifier guarantee it will report a reclaim of `[pointer, pointer + length)`?
-    /// `false` uses an explicit registration rather than leaking one.
-    fn covers(&self, pointer: *mut u8, length: usize) -> bool;
-
-    /// The allocator extent containing `[pointer, pointer + length)`.
-    ///
-    /// Answering this widens a registration from an exact operand to a whole extent. This lets
-    /// many operands share one `fi_mr_reg` instead of taking one each. The returned range must
-    /// be mapped in its entirety and must be reported to [`invalidate`] as a whole when
-    /// reclaimed, since registering it pins every page in it.
-    ///
-    /// `None` registers the operand's extent only, which is always correct, but not always fast.
-    fn extent_of(&self, pointer: *mut u8, length: usize) -> Option<(usize, usize)> {
-        let _ = (pointer, length);
-        None
-    }
-}
-
-static NOTIFIER: OnceLock<&'static dyn ReclaimNotifier> = OnceLock::new();
-
-/// Install the reclaim notifier, enabling the `fi_mr_reg` cache.
-///
-/// Optionally, call once at startup.
-pub fn install_reclaim_notifier(notifier: &'static dyn ReclaimNotifier) {
-    assert!(
-        NOTIFIER.set(notifier).is_ok(),
-        "reclaim notifier is installed at most once per process"
-    );
-}
-
-/// Whether a registration of this extent may be cached. `false` means register per operation.
-pub(crate) fn will_track(pointer: *mut u8, length: usize) -> bool {
-    NOTIFIER
-        .get()
-        .is_some_and(|notifier| notifier.covers(pointer, length))
-}
-
-/// The extent to register for this operand.
-pub(crate) fn extent_for(pointer: *mut u8, length: usize) -> (usize, usize) {
-    let start = pointer as usize;
-    let operand = (start, start.saturating_add(length));
-    NOTIFIER
-        .get()
-        .and_then(|notifier| notifier.extent_of(pointer, length))
-        // An extent not containing the operand would not work
-        .filter(|(base, end)| *base <= operand.0 && operand.1 <= *end)
-        .unwrap_or(operand)
-}
-
 static REGISTRY: Mutex<Vec<DomainRegions>> = Mutex::new(Vec::new());
 
 struct DomainRegions {
@@ -160,8 +108,8 @@ pub(crate) fn covering(start: usize, end: usize, domain: usize) -> Option<Arc<Re
         .map(|(_, entry)| Arc::clone(&entry.registration))
 }
 
-/// Retire every tracked extent, on any domain, overlapping `[start, end)`. The [`ReclaimNotifier`]
-/// calls this before the pages are reclaimed.
+/// Retire every tracked extent, on any domain, overlapping `[start, end)`. Whoever answered a
+/// [`crate::CacheableSpan`] over these pages calls this before they are reclaimed.
 ///
 /// Retiring is immediate: The entry leaves the registry under the lock, so no later operand can
 /// bind to it. Deregistration is not immediate: It happens when the last lease drops, which may
@@ -236,10 +184,8 @@ fn lock() -> std::sync::MutexGuard<'static, Vec<DomainRegions>> {
 #[cfg(test)]
 #[allow(clippy::expect_used, clippy::unwrap_used)]
 mod tests {
-    use super::{
-        ReclaimNotifier, Registration, clear_domain, covering, extent_for,
-        install_reclaim_notifier, invalidate, track,
-    };
+    use super::{Registration, clear_domain, covering, invalidate, track};
+    use crate::operands::CacheableSpan;
     use crate::sys::{
         FI_READ, FI_REMOTE_READ, FI_REMOTE_WRITE, FI_WRITE, fi_allocinfo, fi_close, fi_domain,
         fi_ep_type_FI_EP_RDM, fi_fabric, fi_freeinfo, fi_getinfo, fi_info, fi_mr_reg, fi_version,
@@ -384,55 +330,53 @@ mod tests {
 
     /// Whole-extent registration, and its guard rail.
     ///
-    /// A notifier that can name the allocator extent containing an operand widens the registration
-    /// to it, so neighbouring operands share one `fi_mr_reg`. A notifier that names a range *not*
-    /// containing the operand is ignored — registering that would pin the wrong memory and leave the
-    /// operand itself unregistered.
-    ///
-    /// The notifier is process-global and installed at most once, so this is the only test that
-    /// touches it.
+    /// A caller that can name the allocator extent containing an operand widens the registration to
+    /// it, so neighbouring operands share one `fi_mr_reg`. A span *not* containing the operand is
+    /// ignored — registering that would pin the wrong memory and leave the operand itself
+    /// unregistered.
     #[test]
-    fn an_extent_aware_notifier_widens_the_registration() {
-        struct Extents;
-        // A stand-in allocator whose extents are 64 KiB aligned, plus one deliberately bogus answer.
+    fn a_cacheable_span_widens_the_registration() {
         const EXTENT: usize = 64 * 1024;
-        impl ReclaimNotifier for Extents {
-            fn covers(&self, _pointer: *mut u8, _length: usize) -> bool {
-                true
-            }
-            fn extent_of(&self, pointer: *mut u8, length: usize) -> Option<(usize, usize)> {
-                let start = pointer as usize;
-                if 1 == length {
-                    // Not containing the operand: the caller must refuse this.
-                    return Some((start + 4096, start + 8192));
-                }
-                // Rounded out at both ends: a stand-in extent that failed to contain its own
-                // operand would make this test depend on where the allocator happened to land.
-                let base = start & !(EXTENT - 1);
-                let end = start
-                    .saturating_add(length)
-                    .next_multiple_of(EXTENT)
-                    .max(base + EXTENT);
-                Some((base, end))
-            }
-        }
-        static EXTENTS: Extents = Extents;
-        install_reclaim_notifier(&EXTENTS);
+        let domain = Domain::open();
+        let mut regions = crate::local_regions::LocalRegions::new(domain.domain);
 
-        let mut memory = vec![0u8; 4096];
-        let pointer = memory.as_mut_ptr();
-        let start = pointer as usize;
+        // Over-allocated and then aligned into: an operand straddling an extent boundary would be
+        // widened to two extents, and whether it does is down to where the allocator landed the
+        // `Vec`. Taking an aligned start makes the claim below about the span, not about luck.
+        const OPERAND: usize = 4096;
+        let mut memory = vec![0u8; 3 * EXTENT];
+        let start = (memory.as_mut_ptr() as usize).next_multiple_of(EXTENT);
+        let pointer = start as *mut u8;
 
-        let (base, end) = extent_for(pointer, memory.len());
-        assert_eq!(start & !(EXTENT - 1), base, "widened to the extent base");
-        assert_eq!(base + EXTENT, end, "widened to the extent end");
+        let span = CacheableSpan::new(start, EXTENT).expect("a span containing the operand");
+        regions
+            .operand(pointer, OPERAND, Some(span))
+            .expect("register the widened span");
+
+        // The whole span is registered, not just the operand: an operand at the far end of it is a
+        // cache hit against the same registration.
+        let neighbour = regions
+            .operand((start + EXTENT - OPERAND) as *mut u8, OPERAND, Some(span))
+            .expect("an operand elsewhere in the span");
+        let cached = covering(start, start + OPERAND, domain.key()).expect("the span is tracked");
         assert!(
-            base <= start && start + memory.len() <= end,
-            "still contains the operand"
+            Arc::ptr_eq(
+                &neighbour.lease.expect("a tracked span always leases"),
+                &cached
+            ),
+            "operands across the span must share one registration"
         );
 
-        // The bogus answer falls back to the operand rather than registering elsewhere.
-        assert_eq!((start, start + 1), extent_for(pointer, 1));
+        // A span that does not contain the operand is refused, and nothing is tracked for it.
+        let outside = start + 2 * EXTENT;
+        let bogus = CacheableSpan::new(outside + EXTENT, OPERAND).expect("a span past the operand");
+        regions
+            .operand(outside as *mut u8, OPERAND, Some(bogus))
+            .expect("falls back to the operand's own extent");
+        assert!(
+            covering(outside + EXTENT, outside + EXTENT + OPERAND, domain.key()).is_none(),
+            "a span not containing the operand must not be registered"
+        );
     }
 
     /// The same defect reached the other way: `covering` hands out a raw `fid_mr` and drops the
@@ -456,6 +400,79 @@ mod tests {
             Arc::strong_count(&lease),
             "the caller's lease must outlive the registry's, not be closed underneath it"
         );
+    }
+
+    /// A pinned span serves the operands inside it, which is the whole point: one registration up
+    /// front, then no `fi_mr_reg` on the hot path.
+    ///
+    /// Driven through [`crate::local_regions::LocalRegions`] rather than `track` directly, because
+    /// the claim is about `pin` and `operand` agreeing. It lives here for the `Domain` harness.
+    #[test]
+    fn a_pinned_span_serves_the_operands_inside_it() {
+        let domain = Domain::open();
+        let mut arena = vec![0u8; 64 * 1024];
+        let base = arena.as_mut_ptr() as usize;
+        let mut regions = crate::local_regions::LocalRegions::new(domain.domain);
+
+        regions.pin(base, arena.len()).expect("pin the arena");
+
+        // An operand well inside the span resolves out of the cache, with no span of its own...
+        let operand = regions
+            .operand((base + 4096) as *mut u8, 4096, None)
+            .expect("operand inside a pinned span");
+        let lease = operand.lease.expect("a pinned span always leases");
+        // ...and it is the pinned registration, not a second one taken for this operand.
+        let cached = covering(base + 4096, base + 8192, domain.key()).expect("still registered");
+        assert!(
+            Arc::ptr_eq(&lease, &cached),
+            "the operand must reuse the pinned registration"
+        );
+    }
+
+    /// Dropping the caller's region retires the registration, and an operand already holding a lease
+    /// keeps its descriptor valid — the same rule as a reclaim, reached the other way.
+    #[test]
+    fn dropping_a_region_retires_its_registration() {
+        let domain = Domain::open();
+        let mut arena = vec![0u8; 8192];
+        let base = arena.as_mut_ptr() as usize;
+        let end = base + arena.len();
+        let mut regions = crate::local_regions::LocalRegions::new(domain.domain);
+        regions.pin(base, arena.len()).expect("pin the arena");
+
+        let lease = covering(base, end, domain.key()).expect("just pinned");
+        let region = crate::MemoryRegion::new(Box::new(arena), base, end);
+        drop(region);
+
+        assert!(
+            covering(base, end, domain.key()).is_none(),
+            "a dropped region must leave the registry immediately"
+        );
+        assert_eq!(
+            1,
+            Arc::strong_count(&lease),
+            "an operand mid-flight must be the last holder, not a holder of a closed region"
+        );
+    }
+
+    /// A region outliving its server is safe: the endpoint already closed this domain's
+    /// registrations, so the region's own `invalidate` finds nothing and closes nothing twice.
+    #[test]
+    fn a_region_outliving_its_endpoint_closes_nothing_twice() {
+        let domain = Domain::open();
+        let mut arena = vec![0u8; 8192];
+        let base = arena.as_mut_ptr() as usize;
+        let end = base + arena.len();
+        let mut regions = crate::local_regions::LocalRegions::new(domain.domain);
+        regions.pin(base, arena.len()).expect("pin the arena");
+
+        // The server goes first.
+        clear_domain(domain.key());
+        assert!(covering(base, end, domain.key()).is_none());
+
+        // Then the caller's region. A second close here would fault inside libfabric.
+        drop(crate::MemoryRegion::new(Box::new(arena), base, end));
+        assert!(covering(base, end, domain.key()).is_none());
     }
 
     /// The race the hardware hit, driven directly: many threads resolve operands out of the cache
