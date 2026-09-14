@@ -16,6 +16,7 @@ use std::task::{Context, Poll, Waker};
 use dma_libfabric_protocol::DmaError;
 
 use crate::configuration::Configuration;
+use crate::memory_region::MemoryRegion;
 use crate::operands::Operands;
 use crate::pool::Pool;
 use crate::server::{
@@ -175,6 +176,15 @@ impl<TContext: Operands + Send + 'static> FabricServer<TContext> {
             Ok(()) => Ok(Transfer { cell }),
             Err(request) => Err(map_context(request, |awaited| awaited.user)),
         }
+    }
+
+    /// Register `storage` so operands using it avoid `fi_mr_reg`. Same rules
+    /// as [`crate::FabricServer::register`]
+    pub fn register<S>(&self, storage: S) -> Result<MemoryRegion<S>, DmaError>
+    where
+        S: AsRef<[u8]> + Send + Sync + 'static,
+    {
+        self.inner.register(storage)
     }
 
     /// This endpoint's fabric address, for your control channel. See [`crate::FabricServer`].
