@@ -398,7 +398,7 @@ impl LibfabricEndpoint {
         &mut self,
         pointer: *mut u8,
         length: usize,
-        cacheable: Option<CacheableSpan>,
+        cacheable: impl FnOnce() -> Option<CacheableSpan>,
     ) -> Result<LocalOperand, DmaError> {
         if !self.requires_local_mr {
             return Ok(LocalOperand {

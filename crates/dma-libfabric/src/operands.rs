@@ -53,8 +53,10 @@ pub trait Operands {
     /// its pages are unmapped, decommitted, or madvised away. Widening it past the operand lets
     /// neighboring operands share the one registration, at the cost of pinning the whole span.
     ///
-    /// Called on the worker, after the operand resolves. A span not containing the operand is
-    /// ignored — registering it would pin the wrong memory and leave the operand unregistered.
+    /// Called on the worker, after the operand resolves, and only when no cached registration
+    /// already covers the operand, so per-extent setup here costs once per registration. A span not
+    /// containing the operand is ignored — registering it would pin the wrong memory and leave the
+    /// operand unregistered.
     ///
     /// `None`, the default, registers the operand for this transfer and closes it at completion.
     /// Memory registered through [`crate::FabricServer::register`] doesn't need this treatment.

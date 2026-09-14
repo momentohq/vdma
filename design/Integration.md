@@ -21,19 +21,21 @@ pub trait Operands {
     fn source(&self) -> Option<&[u8]> { None }
     /// The buffer a `FromPeer` receives into.
     fn allocate(&mut self, length: usize) -> Option<&mut [u8]> { None }
+    /// A span around the operand whose registration may outlive this transfer.
+    fn cacheable_span(&self) -> Option<CacheableSpan> { None }
 }
 ```
 
-Both default to unsupported, so a context must implement the direction it serves. A transfer
-whose direction has no operand fails. `Vec<u8>` implements both, so it works as a context if
-you want to use it to get started.
+Both operand methods default to unsupported, so a context must implement the direction it serves.
+A transfer whose direction has no operand fails. `Vec<u8>` implements both, so it works as a
+context if you want to use it to get started. `cacheable_span` is an optimization, covered under
+"Memory your allocator owns" below.
 
 **A completion hook**, `BatchCompleter<T> = Box<dyn Fn(Drain<Completion<T>>) + Send + Sync>`. This
 receives batches of completions. Batches are done to try to minimize downstream synchronization
 costs.
 
-**Configuration**: Providers, interface names, source bind address, in-flight cap (default 64), and
-CRC pool size.
+**Configuration**: Providers, interface names, source bind address, in-flight cap (default 64)
 
 **A `Pool`**, to be shared by each libfabric server.
 
@@ -79,10 +81,7 @@ Do not block your hooks. Time spent in your hooks on the fabric worker is time t
 is not posting or reaping, which delays every transfer on that device. Heavy or lock-contended work
 belongs on separate threads.
 
-Do not panic. The fabric worker has no guard against panic. A panic in your hook unwinds and kills the
-worker. In-flight transfers are stranded with no completion, and every later `submit` returns `Err`.
-The failure surfaces to in-flight callers as a hang. Catch your own panics if your completion path can
-produce one.
+Avoid panics.
 
 # Interaction model
 
@@ -93,16 +92,16 @@ produce one.
    deliver every device's address, since any of them may serve a given transfer.
 3. **Transfer.** Build and submit a `TransferRequest`, which is your `client_id`, a peer address, remote
    key, remote address, direction (`ToPeer`, or `FromPeer { length }` for how many bytes to read),
-   choice of CRC, and your context. (Keep that `client_id` stable for the life of your client and don't
-   reuse client ids)
+   choice of CRC, your context, and a `parent_id`: the `tracing` span id to parent the on-wire span
+   under, or `None`. (Keep that `client_id` stable for the life of your client and don't reuse
+   client ids)
 4. **Complete.** Your hook receives `Completion { caller_context, outcome }`. Completions are unordered
    with respect to submission.
 5. **Disconnect.** `remove_peer(client_id)` drops that id's address-vector entry. It is ordered after
    transfers you already submitted on that server, and the worker defers it until that id's in-flight
    ops drain. Tell every server that could have ever served this client_id (or all of them).
 6. **Shut down.** Dropping `FabricServer` closes the channel. The worker drains what is in flight,
-   completes it through your hook, and joins. Requests still queued are failed with
-   `fabric worker is gone`.
+   completes it through your hook, and joins.
 
 The submission channel doesn't model backpressure on your behalf. `FabricServer::outstanding()` counts
 submitted but unfinished transfers, and is useful for balancing across devices or throttling.
@@ -114,7 +113,11 @@ its own completion hook. `transfer` hands you a future that resolves to your out
 
 ```rust
 let server: asynchronous::FabricServer<Operation> = asynchronous::FabricServer::start(&config, pool)?;
-let (outcome, operation) = server.transfer(request)?.await;
+// `Err` hands the request back, with your context in it, when the worker is gone.
+let Ok(transfer) = server.transfer(request) else {
+    return Err(DmaError::Fabric("fabric worker is gone".into()));
+};
+let (outcome, operation) = transfer.await;
 ```
 
 `Transfer` is a plain `Future`, and doesn't expect any particular hosting runtime. It uses Wakers directly.

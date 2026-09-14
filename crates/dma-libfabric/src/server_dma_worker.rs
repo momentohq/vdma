@@ -22,7 +22,6 @@ use crate::TransferRequest;
 use crate::endpoint::LibfabricEndpoint;
 use crate::error::fabric_error;
 use crate::local_regions::LocalOperand;
-use crate::operands::CacheableSpan;
 use crate::pool::Pool;
 use crate::region_cache::Registration;
 use crate::server::WorkerMessage;
@@ -362,12 +361,19 @@ fn reclaim<T>(context: *mut InFlight<T>) -> Box<InFlight<T>> {
 
 /// Post one prepared transfer, returning the raw libfabric code (`0` posted, `-FI_EAGAIN` transmit
 /// queue full, else error), or `Err` for a setup failure: peer insert or region registration.
-fn post<T>(endpoint: &mut LibfabricEndpoint, prepared: &Prepared<T>) -> Result<isize, DmaError> {
+fn post<T: Operands>(
+    endpoint: &mut LibfabricEndpoint,
+    prepared: &Prepared<T>,
+) -> Result<isize, DmaError> {
     let peer = endpoint.insert_peer(prepared.client_id, &prepared.peer_address)?;
     let context = prepared.context.cast::<c_void>();
     let length = prepared.length;
+    // Asked only on a registration cache miss, so a caller's per-extent setup runs once per
+    // registration rather than once per transfer.
+    // SAFETY: `context` is this operation's live `InFlight`, and nothing else touches it until posted.
+    let cacheable_span = || unsafe { (*prepared.context).caller_context.cacheable_span() };
     let LocalOperand { descriptor, lease } =
-        endpoint.local_operand(prepared.pointer, length, prepared.cacheable_span)?;
+        endpoint.local_operand(prepared.pointer, length, cacheable_span)?;
     let connection = endpoint.connection(&peer, prepared.remote_key, prepared.remote_address);
     // On-wire time, as an explicit child of the caller's `dma.get`/`dma.set` span so the transfer
     // tree covers setup -> wire -> completion without entering the parent on this thread. Stored in
@@ -503,8 +509,6 @@ struct Prepared<T> {
     /// The resolved local operand pointer must stay valid for the post.
     pointer: *mut u8,
     length: usize,
-    /// The caller's span for this operand
-    cacheable_span: Option<CacheableSpan>,
     direction: Direction,
     /// The caller's transfer span, parent of the on-wire span.
     parent_id: Option<tracing::span::Id>,
@@ -558,7 +562,6 @@ fn prepare<T: Operands>(request: TransferRequest<T>) -> Result<Prepared<T>, Comp
     };
     inflight.buffer_pointer = pointer;
     inflight.length = length;
-    let cacheable_span = inflight.caller_context.cacheable_span();
     Ok(Prepared {
         context: Box::into_raw(inflight),
         client_id: request.client_id,
@@ -567,7 +570,6 @@ fn prepare<T: Operands>(request: TransferRequest<T>) -> Result<Prepared<T>, Comp
         remote_address: request.remote_address,
         pointer,
         length,
-        cacheable_span,
         direction: request.direction,
         parent_id: request.parent_id,
     })

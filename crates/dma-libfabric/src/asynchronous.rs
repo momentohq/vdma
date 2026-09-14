@@ -63,6 +63,10 @@ impl<TContext: Operands> Operands for Awaited<TContext> {
     fn allocate(&mut self, length: usize) -> Option<&mut [u8]> {
         self.user.allocate(length)
     }
+
+    fn cacheable_span(&self) -> Option<crate::CacheableSpan> {
+        self.user.cacheable_span()
+    }
 }
 
 /// A submitted transfer. Resolves to the outcome and the context you submitted.

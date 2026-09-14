@@ -44,13 +44,14 @@ impl LocalRegions {
     /// memory is reclaimed, so it stays valid as long as the operand does — which spans the
     /// transfer, since the transfer retains its operand.
     ///
-    /// `cacheable` is the caller's [`crate::CacheableSpan`] for this operand. `None` registers the
-    /// operand's own extent and keeps it out of the cache.
+    /// `cacheable` yields the caller's [`crate::CacheableSpan`] for this operand. It is asked only
+    /// on a miss, so it pays once per registration rather than once per transfer.
+    /// `None` registers the operand's extent and keeps it out of the cache.
     pub(crate) fn operand(
         &mut self,
         pointer: *mut u8,
         length: usize,
-        cacheable: Option<CacheableSpan>,
+        cacheable: impl FnOnce() -> Option<CacheableSpan>,
     ) -> Result<LocalOperand, DmaError> {
         let start = pointer as usize;
         let end = start
@@ -70,7 +71,7 @@ impl LocalRegions {
 
         // A span not containing the operand would pin the wrong memory and leave the operand itself
         // unregistered, so it is refused here rather than trusted.
-        let cacheable = cacheable.filter(|span| span.contains(start, end));
+        let cacheable = cacheable().filter(|span| span.contains(start, end));
         // Register the caller's whole span when there is one, so the next operand landing inside it
         // reuses this registration instead of taking its own.
         let (base, limit) = cacheable.map_or((start, end), |span| (span.base, span.end));

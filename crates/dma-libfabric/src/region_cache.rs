@@ -350,13 +350,15 @@ mod tests {
 
         let span = CacheableSpan::new(start, EXTENT).expect("a span containing the operand");
         regions
-            .operand(pointer, OPERAND, Some(span))
+            .operand(pointer, OPERAND, || Some(span))
             .expect("register the widened span");
 
         // The whole span is registered, not just the operand: an operand at the far end of it is a
-        // cache hit against the same registration.
+        // cache hit against the same registration, and a hit never asks the caller for its span.
         let neighbour = regions
-            .operand((start + EXTENT - OPERAND) as *mut u8, OPERAND, Some(span))
+            .operand((start + EXTENT - OPERAND) as *mut u8, OPERAND, || {
+                panic!("a cache hit must not ask for a span")
+            })
             .expect("an operand elsewhere in the span");
         let cached = covering(start, start + OPERAND, domain.key()).expect("the span is tracked");
         assert!(
@@ -371,7 +373,7 @@ mod tests {
         let outside = start + 2 * EXTENT;
         let bogus = CacheableSpan::new(outside + EXTENT, OPERAND).expect("a span past the operand");
         regions
-            .operand(outside as *mut u8, OPERAND, Some(bogus))
+            .operand(outside as *mut u8, OPERAND, || Some(bogus))
             .expect("falls back to the operand's own extent");
         assert!(
             covering(outside + EXTENT, outside + EXTENT + OPERAND, domain.key()).is_none(),
@@ -418,7 +420,7 @@ mod tests {
 
         // An operand well inside the span resolves out of the cache, with no span of its own...
         let operand = regions
-            .operand((base + 4096) as *mut u8, 4096, None)
+            .operand((base + 4096) as *mut u8, 4096, || None)
             .expect("operand inside a pinned span");
         let lease = operand.lease.expect("a pinned span always leases");
         // ...and it is the pinned registration, not a second one taken for this operand.
