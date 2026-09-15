@@ -85,6 +85,13 @@ pub fn worker_main<T: Operands + Send + 'static>(
                     &mut pending,
                     &mut completions,
                 ),
+                Ok(WorkerMessage::AddPeer {
+                    client_id,
+                    address,
+                    reply,
+                }) => {
+                    let _ = reply.send(endpoint.insert_peer(client_id, &address).map(|_| ()));
+                }
                 Ok(WorkerMessage::RemovePeer(client_id)) => remove_or_defer(
                     &mut endpoint,
                     &outstanding_by_client,
@@ -213,6 +220,13 @@ pub fn worker_main<T: Operands + Send + 'static>(
                     &mut pending,
                     &mut completions,
                 ),
+                Ok(WorkerMessage::AddPeer {
+                    client_id,
+                    address,
+                    reply,
+                }) => {
+                    let _ = reply.send(endpoint.insert_peer(client_id, &address).map(|_| ()));
+                }
                 // Nothing is outstanding here, so this client has no ops to drain: remove now.
                 Ok(WorkerMessage::RemovePeer(client_id)) => remove_or_defer(
                     &mut endpoint,

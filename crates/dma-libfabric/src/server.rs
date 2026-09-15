@@ -74,6 +74,13 @@ pub struct TransferRequest<TContext> {
 /// every transfer the client already submitted.
 pub enum WorkerMessage<TContext> {
     Transfer(TransferRequest<TContext>),
+    /// Insert a client's peer address ahead of its first transfer, answering on `reply`, so the
+    /// caller's hello can fail if the address is unusable rather than its first transfer.
+    AddPeer {
+        client_id: u64,
+        address: Vec<u8>,
+        reply: Sender<Result<(), DmaError>>,
+    },
     /// Remove this disconnected client's peer once its in-flight transfers have drained.
     RemovePeer(u64),
     /// Register a caller-owned span on this worker's domain, answering on `reply`. This keeps
@@ -242,6 +249,25 @@ impl<TContext: Send + 'static> FabricServer<TContext> {
         Ok(MemoryRegion::new(storage, base, end))
     }
 
+    /// Insert `address` into this endpoint's address vector for `client_id`.
+    pub fn add_peer(&self, client_id: u64, address: &[u8]) -> Result<(), DmaError> {
+        let sender = self
+            .sender
+            .as_ref()
+            .ok_or_else(|| DmaError::Fabric("fabric worker is gone".into()))?;
+        let (reply, answer) = channel();
+        sender
+            .send(WorkerMessage::AddPeer {
+                client_id,
+                address: address.to_vec(),
+                reply,
+            })
+            .map_err(|_| DmaError::Fabric("fabric worker is gone".into()))?;
+        answer
+            .recv()
+            .map_err(|_| DmaError::Fabric("fabric worker exited before adding the peer".into()))?
+    }
+
     /// Ask the worker to drop a disconnected client's address-vector entry once its in-flight
     /// transfers drain. Best-effort: if the worker is gone the entry dies with the endpoint.
     pub fn remove_peer(&self, client_id: u64) {
@@ -258,5 +284,38 @@ impl<T: Send + 'static> Drop for FabricServer<T> {
         if let Some(handle) = self.dma_worker_handle.take() {
             let _ = handle.join();
         }
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+mod tests {
+    use std::sync::Arc;
+
+    use super::{Completion, FabricServer};
+    use crate::configuration::{Configuration, Provider};
+    use crate::pool::Pool;
+
+    /// A real tcp server on loopback.
+    fn server() -> FabricServer<Vec<u8>> {
+        let configuration = Configuration {
+            providers: vec![Provider::Tcp],
+            bind: Some("127.0.0.1".to_string()),
+            ..Configuration::default()
+        };
+        let pool = Arc::new(Pool::new(1).expect("pool"));
+        let complete = Box::new(|_: std::vec::Drain<'_, Completion<Vec<u8>>>| {});
+        FabricServer::start(&configuration, complete, pool).expect("tcp server")
+    }
+
+    /// A hello inserts the peer with no transfer in sight, and asking again for the same address
+    /// shares the entry rather than failing or duplicating it.
+    #[test]
+    fn add_peer_inserts_ahead_of_any_transfer() {
+        let server = server();
+        let address = server.local_address().to_vec();
+        server.add_peer(1, &address).expect("first insert");
+        server.add_peer(1, &address).expect("same address again");
+        server.remove_peer(1);
     }
 }

@@ -201,6 +201,12 @@ impl<TContext: Operands + Send + 'static> FabricServer<TContext> {
         self.inner.outstanding()
     }
 
+    /// Insert a client's peer address ahead of its first transfer. See
+    /// [`crate::FabricServer::add_peer`].
+    pub fn add_peer(&self, client_id: u64, address: &[u8]) -> Result<(), DmaError> {
+        self.inner.add_peer(client_id, address)
+    }
+
     /// Drop a disconnected client's address-vector entry once its transfers drain.
     pub fn remove_peer(&self, client_id: u64) {
         self.inner.remove_peer(client_id);
