@@ -19,6 +19,7 @@ mod operands;
 mod peer_addresses;
 mod pool;
 mod region_cache;
+mod reply;
 mod server;
 mod server_dma_worker;
 #[doc(hidden)]

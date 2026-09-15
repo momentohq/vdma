@@ -20,6 +20,7 @@ use crate::configuration::Configuration;
 use crate::memory_region::MemoryRegion;
 use crate::operands::Operands;
 use crate::pool::Pool;
+use crate::reply::{Answer, reply};
 
 /// Direction of the one-sided RMA the server initiates against the client's exposed buffer.
 #[derive(Debug, Clone, Copy)]
@@ -79,7 +80,7 @@ pub enum WorkerMessage<TContext> {
     AddPeer {
         client_id: u64,
         address: Vec<u8>,
-        reply: Sender<Result<(), DmaError>>,
+        reply: Answer<Result<(), DmaError>>,
     },
     /// Remove this disconnected client's peer once its in-flight transfers have drained.
     RemovePeer(u64),
@@ -88,7 +89,7 @@ pub enum WorkerMessage<TContext> {
     Register {
         base: usize,
         length: usize,
-        reply: Sender<Result<(), DmaError>>,
+        reply: Answer<Result<(), DmaError>>,
     },
 }
 
@@ -132,7 +133,7 @@ impl<TContext: Send + 'static> FabricServer<TContext> {
         TContext: Operands,
     {
         let (sender, receiver) = channel();
-        let (ready_sender, ready_receiver) = channel();
+        let (ready_answer, ready) = reply();
         let configuration = configuration.clone();
         // Shared with the pool jobs finishing checksummed transfers off the worker thread.
         let complete_batch = Arc::new(complete_batch);
@@ -148,7 +149,7 @@ impl<TContext: Send + 'static> FabricServer<TContext> {
             .spawn(move || {
                 crate::server_dma_worker::worker_main(
                     configuration,
-                    &ready_sender,
+                    ready_answer,
                     &receiver,
                     complete_batch,
                     pool,
@@ -156,18 +157,18 @@ impl<TContext: Send + 'static> FabricServer<TContext> {
                 )
             })
             .map_err(|error| DmaError::Fabric(format!("failed to spawn fabric worker: {error}")))?;
-        match ready_receiver.recv() {
-            Ok(Ok(address)) => Ok(Self {
+        match ready.wait() {
+            Some(Ok(address)) => Ok(Self {
                 sender: Some(sender),
                 dma_worker_handle: Some(handle),
                 address,
                 outstanding,
             }),
-            Ok(Err(error)) => {
+            Some(Err(error)) => {
                 let _ = handle.join();
                 Err(error)
             }
-            Err(_) => Err(DmaError::Fabric(
+            None => Err(DmaError::Fabric(
                 "fabric worker exited before signalling readiness".into(),
             )),
         }
@@ -235,17 +236,17 @@ impl<TContext: Send + 'static> FabricServer<TContext> {
             .sender
             .as_ref()
             .ok_or_else(|| DmaError::Fabric("fabric worker is gone".into()))?;
-        let (reply, answer) = channel();
+        let (answer, waiting) = reply();
         sender
             .send(WorkerMessage::Register {
                 base,
                 length,
-                reply,
+                reply: answer,
             })
             .map_err(|_| DmaError::Fabric("fabric worker is gone".into()))?;
-        answer
-            .recv()
-            .map_err(|_| DmaError::Fabric("fabric worker exited before registering".into()))??;
+        waiting
+            .wait()
+            .ok_or_else(|| DmaError::Fabric("fabric worker exited before registering".into()))??;
         Ok(MemoryRegion::new(storage, base, end))
     }
 
@@ -255,17 +256,17 @@ impl<TContext: Send + 'static> FabricServer<TContext> {
             .sender
             .as_ref()
             .ok_or_else(|| DmaError::Fabric("fabric worker is gone".into()))?;
-        let (reply, answer) = channel();
+        let (answer, waiting) = reply();
         sender
             .send(WorkerMessage::AddPeer {
                 client_id,
                 address: address.to_vec(),
-                reply,
+                reply: answer,
             })
             .map_err(|_| DmaError::Fabric("fabric worker is gone".into()))?;
-        answer
-            .recv()
-            .map_err(|_| DmaError::Fabric("fabric worker exited before adding the peer".into()))?
+        waiting
+            .wait()
+            .ok_or_else(|| DmaError::Fabric("fabric worker exited before adding the peer".into()))?
     }
 
     /// Ask the worker to drop a disconnected client's address-vector entry once its in-flight

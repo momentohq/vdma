@@ -7,7 +7,6 @@ use std::collections::HashSet;
 use std::collections::VecDeque;
 use std::os::raw::c_void;
 use std::sync::Arc;
-use std::sync::mpsc::Sender;
 use std::sync::mpsc::{Receiver, TryRecvError};
 
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -24,6 +23,7 @@ use crate::error::fabric_error;
 use crate::local_regions::LocalOperand;
 use crate::pool::Pool;
 use crate::region_cache::Registration;
+use crate::reply::Answer;
 use crate::server::WorkerMessage;
 
 /// Completions to reap in one pass, and the batch size that triggers a flush — bounding what one
@@ -32,7 +32,7 @@ const TARGET_COMPLETIONS: usize = 10;
 
 pub fn worker_main<T: Operands + Send + 'static>(
     configuration: Configuration,
-    ready: &Sender<Result<Vec<u8>, DmaError>>,
+    ready: Answer<Result<Vec<u8>, DmaError>>,
     receiver: &Receiver<WorkerMessage<T>>,
     complete_batch: Arc<BatchCompleter<T>>,
     pool: Arc<Pool>,
@@ -46,11 +46,11 @@ pub fn worker_main<T: Operands + Send + 'static>(
             Ok((endpoint, address))
         }) {
         Ok((endpoint, address)) => {
-            let _ = ready.send(Ok(address));
+            ready.send(Ok(address));
             endpoint
         }
         Err(error) => {
-            let _ = ready.send(Err(error));
+            ready.send(Err(error));
             return;
         }
     };
@@ -90,7 +90,7 @@ pub fn worker_main<T: Operands + Send + 'static>(
                     address,
                     reply,
                 }) => {
-                    let _ = reply.send(endpoint.insert_peer(client_id, &address).map(|_| ()));
+                    reply.send(endpoint.insert_peer(client_id, &address).map(|_| ()));
                 }
                 Ok(WorkerMessage::RemovePeer(client_id)) => remove_or_defer(
                     &mut endpoint,
@@ -104,7 +104,7 @@ pub fn worker_main<T: Operands + Send + 'static>(
                     length,
                     reply,
                 }) => {
-                    let _ = reply.send(endpoint.pin_region(base, length));
+                    reply.send(endpoint.pin_region(base, length));
                 }
                 Err(TryRecvError::Empty) => break,
                 Err(TryRecvError::Disconnected) => {
@@ -225,7 +225,7 @@ pub fn worker_main<T: Operands + Send + 'static>(
                     address,
                     reply,
                 }) => {
-                    let _ = reply.send(endpoint.insert_peer(client_id, &address).map(|_| ()));
+                    reply.send(endpoint.insert_peer(client_id, &address).map(|_| ()));
                 }
                 // Nothing is outstanding here, so this client has no ops to drain: remove now.
                 Ok(WorkerMessage::RemovePeer(client_id)) => remove_or_defer(
@@ -239,7 +239,7 @@ pub fn worker_main<T: Operands + Send + 'static>(
                     length,
                     reply,
                 }) => {
-                    let _ = reply.send(endpoint.pin_region(base, length));
+                    reply.send(endpoint.pin_region(base, length));
                 }
                 Err(_) => break, // channel closed and nothing left → shutdown
             }
