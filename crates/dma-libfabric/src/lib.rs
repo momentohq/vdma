@@ -1,6 +1,6 @@
 //! Tools for building servers over the OFI (libfabric) C API.
 //!
-//! `LibfabricEndpoint` opens a local `FI_EP_RDM` endpoint; `FabricServer` runs the worker that
+//! `LibfabricEndpoint` opens a local `FI_EP_RDM` endpoint; `FabricService` runs the worker that
 //! posts one-sided RMA against a client's exposed buffer and reaps completions. The peer address and
 //! remote key arrive out-of-band, on the caller's own control channel, per request. Clients are
 //! passive targets and live outside this crate.
@@ -34,5 +34,5 @@ pub use peer_addresses::RegisteredAddress;
 pub use pool::Pool;
 pub use region_cache::invalidate;
 pub use server::{
-    BatchCompleter, Completion, Direction, FabricServer, Outcome, TransferDone, TransferRequest,
+    BatchCompleter, Completion, Direction, FabricService, Outcome, TransferDone, TransferRequest,
 };

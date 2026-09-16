@@ -1,7 +1,7 @@
 //! Asynchronous server-side DMA: `DMA.GET` and `DMA.SET` both run on the pipelined fabric worker.
 //!
 //! The valkey thread only blocks the client, builds the request and submits. The worker
-//! ([`dma_libfabric::FabricServer`]) keeps many transfers in flight off the GIL and returns
+//! ([`dma_libfabric::FabricService`]) keeps many transfers in flight off the GIL and returns
 //! completions in batches; [`complete_batch`] finishes a whole batch under one GIL acquisition.
 //!
 //! - GET sources valkey's own value buffer zero-copy via `CreateStringReferenceFromKey`, a retained
@@ -14,7 +14,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 
 use dma_libfabric::{
-    CacheableSpan, Completion, Configuration as FabricConfiguration, Direction, FabricServer,
+    CacheableSpan, Completion, Configuration as FabricConfiguration, Direction, FabricService,
     Operands, Outcome, Pool, Provider, TransferDone, TransferRequest,
 };
 use dma_libfabric_protocol::{Advertisement, DmaError, encode_hex};
@@ -122,7 +122,7 @@ impl HeldValue {
 
 /// One worker per local EFA device, or a single worker for other providers, opened on first use.
 /// Only valkey's single command thread starts these, so the lazy init cannot race.
-static FABRIC_SERVERS: OnceLock<Vec<FabricServer<OpToken>>> = OnceLock::new();
+static FABRIC_SERVICES: OnceLock<Vec<FabricService<OpToken>>> = OnceLock::new();
 
 /// Rotates between equally loaded devices, so a burst of same-depth choices spreads instead of
 /// stacking on the lowest index.
@@ -130,10 +130,10 @@ static NEXT: AtomicUsize = AtomicUsize::new(0);
 
 /// Start one worker per discovered EFA device, or a single worker for other providers and when
 /// discovery finds nothing. Every worker is a candidate for every transfer.
-fn start_servers(
+fn start_services(
     context: &Context,
     fabric: &FabricConfiguration,
-) -> Result<Vec<FabricServer<OpToken>>, DmaError> {
+) -> Result<Vec<FabricService<OpToken>>, DmaError> {
     let domains = if matches!(fabric.providers.first(), Some(Provider::EfaDirect)) {
         dma_libfabric::discover_domains(fabric).unwrap_or_default()
     } else {
@@ -152,7 +152,7 @@ fn start_servers(
             context,
             "valkey-dma: starting 1 fabric worker (single device)",
         );
-        return Ok(vec![FabricServer::start(
+        return Ok(vec![FabricService::start(
             fabric,
             Box::new(complete_batch),
             pool,
@@ -170,7 +170,7 @@ fn start_servers(
     for domain in &domains {
         let mut per_device = fabric.clone();
         per_device.interfaces = vec![domain.clone()];
-        servers.push(FabricServer::start(
+        servers.push(FabricService::start(
             &per_device,
             Box::new(complete_batch),
             Arc::clone(&pool),
@@ -179,24 +179,24 @@ fn start_servers(
     Ok(servers)
 }
 
-fn fabric_servers(context: &Context) -> Result<&'static [FabricServer<OpToken>], DmaError> {
-    if let Some(servers) = FABRIC_SERVERS.get() {
+fn fabric_services(context: &Context) -> Result<&'static [FabricService<OpToken>], DmaError> {
+    if let Some(servers) = FABRIC_SERVICES.get() {
         return Ok(servers);
     }
     let configuration = static_state::configuration();
-    let servers = start_servers(context, &configuration.dma_libfabric)?;
-    let _ = FABRIC_SERVERS.set(servers);
-    FABRIC_SERVERS
+    let servers = start_services(context, &configuration.dma_libfabric)?;
+    let _ = FABRIC_SERVICES.set(servers);
+    FABRIC_SERVICES
         .get()
         .map(Vec::as_slice)
-        .ok_or_else(|| DmaError::Fabric("fabric servers unavailable".into()))
+        .ok_or_else(|| DmaError::Fabric("fabric services unavailable".into()))
 }
 
 /// The device with the least work outstanding, chosen per operation. Every worker's address is
 /// advertised by `dma.hello`, so any of them may initiate against a client and none is pinned to one.
 /// Ties rotate through `NEXT`, which matters at low load where every device reads zero.
-fn least_loaded_server(context: &Context) -> Result<&'static FabricServer<OpToken>, DmaError> {
-    let servers = fabric_servers(context)?;
+fn least_loaded_server(context: &Context) -> Result<&'static FabricService<OpToken>, DmaError> {
+    let servers = fabric_services(context)?;
     let rotation = NEXT.fetch_add(1, Ordering::Relaxed);
     servers
         .iter()
@@ -223,7 +223,7 @@ fn on_client_change(context: &Context, subevent: ClientChangeSubevent) {
 /// until that client's in-flight ops on it drain. Any device may have served this client, so all are
 /// told; a worker that never saw it does nothing.
 fn release_client(client_id: u64) {
-    let Some(servers) = FABRIC_SERVERS.get() else {
+    let Some(servers) = FABRIC_SERVICES.get() else {
         return;
     };
     for server in servers {
@@ -237,7 +237,7 @@ fn release_client(client_id: u64) {
 /// address, and which device serves a given operation is chosen per operation. Starts the workers if
 /// they aren't up.
 pub fn dma_hello(context: &Context) -> ValkeyResult {
-    let servers = fabric_servers(context).map_err(command_error)?;
+    let servers = fabric_services(context).map_err(command_error)?;
     Ok(ValkeyValue::Array(
         servers
             .iter()
@@ -509,7 +509,7 @@ pub fn dma_set(
 }
 
 /// Submit a request, finishing it inline if the worker is gone so the blocked client isn't stranded.
-fn submit(context: &Context, server: &FabricServer<OpToken>, request: TransferRequest<OpToken>) {
+fn submit(context: &Context, server: &FabricService<OpToken>, request: TransferRequest<OpToken>) {
     if let Err(request) = server.submit(request) {
         // Command thread with the GIL held: do the keyspace half, then reply with the failure.
         let pending = finish_under_gil(

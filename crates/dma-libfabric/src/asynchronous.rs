@@ -149,16 +149,16 @@ fn map_context<TOld, TNew>(
     }
 }
 
-/// A [`crate::FabricServer`] that hands back futures. It installs its own completion hook.
+/// A [`crate::FabricService`] that hands back futures. It installs its own completion hook.
 #[derive(Debug)]
-pub struct FabricServer<TContext: Send + 'static> {
-    inner: server::FabricServer<Awaited<TContext>>,
+pub struct FabricService<TContext: Send + 'static> {
+    inner: server::FabricService<Awaited<TContext>>,
 }
 
-impl<TContext: Operands + Send + 'static> FabricServer<TContext> {
+impl<TContext: Operands + Send + 'static> FabricService<TContext> {
     /// Open the endpoint, blocking until it is up or fails.
     pub fn start(configuration: &Configuration, pool: Arc<Pool>) -> Result<Self, DmaError> {
-        let inner = server::FabricServer::start(configuration, Box::new(complete_batch), pool)?;
+        let inner = server::FabricService::start(configuration, Box::new(complete_batch), pool)?;
         Ok(Self { inner })
     }
 
@@ -183,7 +183,7 @@ impl<TContext: Operands + Send + 'static> FabricServer<TContext> {
     }
 
     /// Register `storage` so operands using it avoid `fi_mr_reg`. Same rules
-    /// as [`crate::FabricServer::register`]
+    /// as [`crate::FabricService::register`]
     pub fn register<S>(&self, storage: S) -> Result<MemoryRegion<S>, DmaError>
     where
         S: AsRef<[u8]> + Send + Sync + 'static,
@@ -191,7 +191,7 @@ impl<TContext: Operands + Send + 'static> FabricServer<TContext> {
         self.inner.register(storage)
     }
 
-    /// This endpoint's fabric address, for your control channel. See [`crate::FabricServer`].
+    /// This endpoint's fabric address, for your control channel. See [`crate::FabricService`].
     pub fn local_address(&self) -> &[u8] {
         self.inner.local_address()
     }
@@ -202,7 +202,7 @@ impl<TContext: Operands + Send + 'static> FabricServer<TContext> {
     }
 
     /// Insert a client's peer address ahead of its first transfer. See
-    /// [`crate::FabricServer::add_peer`].
+    /// [`crate::FabricService::add_peer`].
     pub fn add_peer(&self, client_id: u64, address: &[u8]) -> Result<(), DmaError> {
         self.inner.add_peer(client_id, address)
     }

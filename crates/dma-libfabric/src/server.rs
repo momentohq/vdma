@@ -1,7 +1,7 @@
 //! A background worker that keeps many of the server's one-sided RMAs in flight at once.
 //!
 //! libfabric RMA is asynchronous: posting a `fi_writemsg`/`fi_read` returns immediately and the
-//! completion arrives later on the completion queue. `FabricServer` exploits that with one
+//! completion arrives later on the completion queue. `FabricService` exploits that with one
 //! event-loop thread over one endpoint: it drains submitted [`TransferRequest`]s, posts up to an
 //! in-flight cap without waiting, reaps completions in batches, and dispatches each by its
 //! `op_context`, the per-op heap pointer that identifies which transfer completed.
@@ -98,7 +98,7 @@ pub enum WorkerMessage<TContext> {
 ///
 /// Owns the `fabric-nn` worker thread and the submission channel. Dropping the server closes the
 /// channel, so the worker drains its in-flight ops, exits, and is joined.
-pub struct FabricServer<TContext: Send + 'static> {
+pub struct FabricService<TContext: Send + 'static> {
     sender: Option<Sender<WorkerMessage<TContext>>>,
     dma_worker_handle: Option<JoinHandle<()>>,
     /// The worker endpoint's fabric address, captured at startup. `efa-direct` requires the target
@@ -111,16 +111,16 @@ pub struct FabricServer<TContext: Send + 'static> {
     outstanding: Arc<AtomicUsize>,
 }
 
-impl<TContext: Send + 'static> std::fmt::Debug for FabricServer<TContext> {
+impl<TContext: Send + 'static> std::fmt::Debug for FabricService<TContext> {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
-            .debug_struct("FabricServer")
+            .debug_struct("FabricService")
             .field("running", &self.sender.is_some())
             .finish()
     }
 }
 
-impl<TContext: Send + 'static> FabricServer<TContext> {
+impl<TContext: Send + 'static> FabricService<TContext> {
     /// Open the server endpoint on a worker thread and start serving transfers, blocking until the
     /// endpoint opens or fails to. Completions run on the worker thread, except checksummed ones,
     /// whose CRC and reply run on the shared `pool`.
@@ -278,7 +278,7 @@ impl<TContext: Send + 'static> FabricServer<TContext> {
     }
 }
 
-impl<T: Send + 'static> Drop for FabricServer<T> {
+impl<T: Send + 'static> Drop for FabricService<T> {
     fn drop(&mut self) {
         // Closing the channel ends the worker's recv loop.
         self.sender = None;
@@ -293,12 +293,12 @@ impl<T: Send + 'static> Drop for FabricServer<T> {
 mod tests {
     use std::sync::Arc;
 
-    use super::{Completion, FabricServer};
+    use super::{Completion, FabricService};
     use crate::configuration::{Configuration, Provider};
     use crate::pool::Pool;
 
     /// A real tcp server on loopback.
-    fn server() -> FabricServer<Vec<u8>> {
+    fn server() -> FabricService<Vec<u8>> {
         let configuration = Configuration {
             providers: vec![Provider::Tcp],
             bind: Some("127.0.0.1".to_string()),
@@ -306,7 +306,7 @@ mod tests {
         };
         let pool = Arc::new(Pool::new(1).expect("pool"));
         let complete = Box::new(|_: std::vec::Drain<'_, Completion<Vec<u8>>>| {});
-        FabricServer::start(&configuration, complete, pool).expect("tcp server")
+        FabricService::start(&configuration, complete, pool).expect("tcp server")
     }
 
     /// A hello inserts the peer with no transfer in sight, and asking again for the same address

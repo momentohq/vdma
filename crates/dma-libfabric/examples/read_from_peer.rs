@@ -11,7 +11,7 @@
 
 use std::sync::Arc;
 
-use dma_libfabric::asynchronous::FabricServer;
+use dma_libfabric::asynchronous::FabricService;
 use dma_libfabric::{Direction, Pool, TransferRequest};
 use dma_libfabric_protocol::{DmaError, encode_hex};
 
@@ -29,7 +29,7 @@ async fn main() -> Result<(), DmaError> {
     } = common::parse()?;
 
     let pool = Arc::new(Pool::new(2).map_err(|error| DmaError::Fabric(format!("pool: {error}")))?);
-    let server: FabricServer<Vec<u8>> = FabricServer::start(&configuration, pool)?;
+    let server: FabricService<Vec<u8>> = FabricService::start(&configuration, pool)?;
 
     // What a peer must hold to be RMA'd against. Send this to peers via your control channel.
     println!("local address: {}", encode_hex(server.local_address()));

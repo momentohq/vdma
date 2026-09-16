@@ -59,7 +59,7 @@ pub trait Operands {
     /// operand unregistered.
     ///
     /// `None`, the default, registers the operand for this transfer and closes it at completion.
-    /// Memory registered through [`crate::FabricServer::register`] doesn't need this treatment.
+    /// Memory registered through [`crate::FabricService::register`] doesn't need this treatment.
     /// Its span is already cached, and the operand resolves out of it either way.
     fn cacheable_span(&self) -> Option<CacheableSpan> {
         None

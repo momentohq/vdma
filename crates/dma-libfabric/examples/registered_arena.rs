@@ -10,14 +10,14 @@
 //!
 //! `one_transfer` registers and closes a region per transfer, because nothing tells this crate when
 //! the payload's pages go away. Here you own the memory, so you say so once with
-//! [`FabricServer::register`] and every operand inside the span is a cache hit afterwards. The
+//! [`FabricService::register`] and every operand inside the span is a cache hit afterwards. The
 //! arena is yours end to end: this crate reads its span once and never touches the bytes.
 
 use std::sync::Arc;
 use std::sync::mpsc::{Sender, channel};
 
 use dma_libfabric::{
-    Completion, Direction, FabricServer, MemoryRegion, Operands, Outcome, Pool, TransferRequest,
+    Completion, Direction, FabricService, MemoryRegion, Operands, Outcome, Pool, TransferRequest,
 };
 use dma_libfabric_protocol::{DmaError, encode_hex};
 
@@ -57,7 +57,7 @@ fn main() -> Result<(), DmaError> {
     } = common::parse()?;
 
     let pool = Arc::new(Pool::new(2).map_err(|error| DmaError::Fabric(format!("pool: {error}")))?);
-    let server = FabricServer::start(&configuration, Box::new(complete), pool)?;
+    let server = FabricService::start(&configuration, Box::new(complete), pool)?;
 
     println!("local address: {}", encode_hex(server.local_address()));
 

@@ -48,7 +48,7 @@ flowchart LR
     subgraph yours["your threads"]
         S["submit()"]
     end
-    subgraph worker["fabric-NN per FabricServer"]
+    subgraph worker["fabric-NN per FabricService"]
         W["drain channel → post → reap → dispatch"]
         W -->|"plain completions"| C1["your completion fn"]
     end
@@ -60,10 +60,10 @@ flowchart LR
     W -->|"offload checksums"| P
 ```
 
-`FabricServer` is `Send + Sync`, so your threads may `submit` concurrently. `submit` is a non-blocking
+`FabricService` is `Send + Sync`, so your threads may `submit` concurrently. `submit` is a non-blocking
 channel send. It returns `Err` when the worker is gone.
 
-`FabricServer::start` spawns a thread, `fabric-00`, `fabric-01`, etc. It drives the endpoint
+`FabricService::start` spawns a thread, `fabric-00`, `fabric-01`, etc. It drives the endpoint
 and does the libfabric needful. It drains the submission channel without blocking, posts transfers
 up to the in-flight cap, coalesces completions, and dispatches each completion with its `op_context`.
 
@@ -85,7 +85,7 @@ Avoid panics.
 
 # Interaction model
 
-1. **Open.** `Pool::new`, then `FabricServer::start` per device. `start` blocks until the endpoint is
+1. **Open.** `Pool::new`, then `FabricService::start` per device. `start` blocks until the endpoint is
    open or fails.
 2. **Advertise.** `local_address()` is the initiator's fabric address. On `efa-direct` a target must
    hold it in its own address vector before you RMA against it. That means your control channel has to
@@ -100,19 +100,19 @@ Avoid panics.
 5. **Disconnect.** `remove_peer(client_id)` drops that id's address-vector entry. It is ordered after
    transfers you already submitted on that server, and the worker defers it until that id's in-flight
    ops drain. Tell every server that could have ever served this client_id (or all of them).
-6. **Shut down.** Dropping `FabricServer` closes the channel. The worker drains what is in flight,
+6. **Shut down.** Dropping `FabricService` closes the channel. The worker drains what is in flight,
    completes it through your hook, and joins.
 
-The submission channel doesn't model backpressure on your behalf. `FabricServer::outstanding()` counts
+The submission channel doesn't model backpressure on your behalf. `FabricService::outstanding()` counts
 submitted but unfinished transfers, and is useful for balancing across devices or throttling.
 
 # Awaiting instead of a completion hook
 
-`asynchronous::FabricServer` is the same server with futures in place of `BatchCompleter`. It installs
+`asynchronous::FabricService` is the same server with futures in place of `BatchCompleter`. It installs
 its own completion hook. `transfer` hands you a future that resolves to your outcome and context.
 
 ```rust
-let server: asynchronous::FabricServer<Operation> = asynchronous::FabricServer::start(&config, pool)?;
+let server: asynchronous::FabricService<Operation> = asynchronous::FabricService::start(&config, pool)?;
 // `Err` hands the request back, with your context in it, when the worker is gone.
 let Ok(transfer) = server.transfer(request) else {
     return Err(DmaError::Fabric("fabric worker is gone".into()));
@@ -138,7 +138,7 @@ whether you own the memory.
 
 ## Memory you own
 
-`FabricServer::register` takes your storage and pins it on that server's domain, handing back a
+`FabricService::register` takes your storage and pins it on that server's domain, handing back a
 `MemoryRegion<S>`:
 
 ```rust
@@ -196,8 +196,8 @@ same thing.
 fabric name is used, rather than the rxr software path. It requires `FI_CONTEXT2`, which the worker
 satisfies internally and ties to your request context.
 
-One endpoint is one device. `discover_domains` gives you a list. Start one `FabricServer` for each and
-choose which FabricServer to use per transfer based on `outstanding()` (or however you want).
+One endpoint is one device. `discover_domains` gives you a list. Start one `FabricService` for each and
+choose which FabricService to use per transfer based on `outstanding()` (or however you want).
 
 # What it does not do
 
