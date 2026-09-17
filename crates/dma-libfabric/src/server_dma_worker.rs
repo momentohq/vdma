@@ -8,6 +8,7 @@ use std::collections::VecDeque;
 use std::os::raw::c_void;
 use std::sync::Arc;
 use std::sync::mpsc::{Receiver, TryRecvError};
+use std::time::Instant;
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -57,6 +58,7 @@ pub fn worker_main<T: Operands + Send + 'static>(
 
     let cap = in_flight_cap(&endpoint, configuration.max_in_flight);
     let again = -(FI_EAGAIN as isize);
+    let progress_deadline = configuration.progress_deadline;
     // Outstanding (queued or in-flight) ops per client, and clients whose peer to remove once that
     // count hits 0. Counting from intake rather than posting stops a removal slipping between a
     // queued transfer and its post, where the post would re-insert the peer just removed. Deferring
@@ -114,10 +116,12 @@ pub fn worker_main<T: Operands + Send + 'static>(
             }
         }
 
-        // Post up to the cap.
+        // Post up to the cap, one pass over the queue.
         let mut posted = 0usize;
-        while in_flight < cap {
-            let Some(prepared) = pending.pop_front() else {
+        let mut attempts = pending.len();
+        while in_flight < cap && 0 < attempts {
+            attempts -= 1;
+            let Some(mut prepared) = pending.pop_front() else {
                 break;
             };
             let error = match post(&mut endpoint, &prepared) {
@@ -127,8 +131,14 @@ pub fn worker_main<T: Operands + Send + 'static>(
                     continue;
                 }
                 Ok(code) if code == again => {
-                    pending.push_front(prepared); // tx queue full: defer, reap to make room
-                    break;
+                    let stalled_since = *prepared.stalled_since.get_or_insert_with(Instant::now);
+                    if stalled_since.elapsed() < progress_deadline {
+                        pending.push_back(prepared);
+                        continue;
+                    }
+                    DmaError::Transfer(format!(
+                        "no progress posting for {progress_deadline:?}: peer unreachable or transmit queue stuck"
+                    ))
                 }
                 Ok(code) => fabric_error(code as i32, "post"),
                 Err(error) => error,
@@ -244,8 +254,16 @@ pub fn worker_main<T: Operands + Send + 'static>(
                 Err(_) => break, // channel closed and nothing left → shutdown
             }
         } else if 0 == posted && !reaped_any {
-            // Work outstanding but nothing moved: don't spin hot.
-            std::hint::spin_loop();
+            if 0 == in_flight {
+                // Everything pending is stalled on -FI_EAGAIN, peers connecting or gone. There is
+                // nothing to reap, so busy-polling probably won't help much. Make sure the core is
+                // available to other work since it probably isn't useful here for at least a few
+                // hundred microseconds.
+                std::thread::yield_now();
+            } else {
+                // Work in flight but nothing moved this pass: stay hot for the completion.
+                std::hint::spin_loop();
+            }
         }
     }
 
@@ -526,6 +544,9 @@ struct Prepared<T> {
     direction: Direction,
     /// The caller's transfer span, parent of the on-wire span.
     parent_id: Option<tracing::span::Id>,
+    /// When the provider first answered this op `-FI_EAGAIN`; the progress deadline counts from
+    /// here. After posting, the op is gone, so this never needs clearing.
+    stalled_since: Option<Instant>,
 }
 
 /// Build the per-op `InFlight` box and the post parameters, resolving the local operand out of the
@@ -586,6 +607,7 @@ fn prepare<T: Operands>(request: TransferRequest<T>) -> Result<Prepared<T>, Comp
         length,
         direction: request.direction,
         parent_id: request.parent_id,
+        stalled_since: None,
     })
 }
 

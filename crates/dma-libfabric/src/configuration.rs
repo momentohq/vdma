@@ -1,5 +1,7 @@
 //! Configuration for the libfabric DMA provider. Aggregated by the `configuration` crate.
 
+use std::time::Duration;
+
 /// Supported libfabric providers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -61,6 +63,15 @@ pub struct Configuration {
     /// though the caller's completion hook still serializes. `None` derives 2 per EFA device.
     #[serde(default)]
     pub crc_pool_threads: Option<usize>,
+    /// How long a transfer may sit unpostable at `-FI_EAGAIN`.
+    /// A connecting or dead client will loop with this status.
+    /// [`DEFAULT_PROGRESS_DEADLINE`].
+    #[serde(default = "default_progress_deadline")]
+    pub progress_deadline: Duration,
+}
+
+fn default_progress_deadline() -> Duration {
+    Duration::from_secs(1)
 }
 
 impl Default for Configuration {
@@ -71,6 +82,7 @@ impl Default for Configuration {
             bind: None,
             max_in_flight: None,
             crc_pool_threads: None,
+            progress_deadline: default_progress_deadline(),
         }
     }
 }

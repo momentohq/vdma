@@ -292,8 +292,9 @@ impl<T: Send + 'static> Drop for FabricService<T> {
 #[allow(clippy::expect_used)]
 mod tests {
     use std::sync::Arc;
+    use std::time::Duration;
 
-    use super::{Completion, FabricService};
+    use super::{Completion, Direction, FabricService, TransferRequest};
     use crate::configuration::{Configuration, Provider};
     use crate::pool::Pool;
 
@@ -307,6 +308,47 @@ mod tests {
         let pool = Arc::new(Pool::new(1).expect("pool"));
         let complete = Box::new(|_: std::vec::Drain<'_, Completion<Vec<u8>>>| {});
         FabricService::start(&configuration, complete, pool).expect("tcp server")
+    }
+
+    /// `FI_SOCKADDR_IN` for 127.0.0.1:1, where nothing listens: the tcp provider's connect never
+    /// establishes and every post answers `-FI_EAGAIN`.
+    const DEAD_PEER: [u8; 16] = [2, 0, 0, 1, 127, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0];
+
+    /// The failure this deadline exists to bound: a peer that never connects must fail the
+    /// transfer instead of leaving it, and its caller, waiting forever.
+    #[test]
+    fn a_transfer_to_a_dead_peer_fails_at_the_progress_deadline() {
+        let configuration = Configuration {
+            providers: vec![Provider::Tcp],
+            bind: Some("127.0.0.1".to_string()),
+            progress_deadline: Duration::from_millis(50),
+            ..Configuration::default()
+        };
+        let pool = Arc::new(Pool::new(1).expect("pool"));
+        let (report, outcomes) = std::sync::mpsc::channel();
+        let complete = Box::new(move |batch: std::vec::Drain<'_, Completion<Vec<u8>>>| {
+            for completion in batch {
+                let _ = report.send(completion.outcome);
+            }
+        });
+        let server = FabricService::start(&configuration, complete, pool).expect("tcp server");
+
+        let request = TransferRequest {
+            client_id: 1,
+            peer_address: DEAD_PEER.to_vec(),
+            remote_key: 0,
+            remote_address: 0,
+            direction: Direction::ToPeer,
+            want_checksum: false,
+            caller_context: vec![0xab; 64],
+            parent_id: None,
+        };
+        assert!(server.submit(request).is_ok());
+
+        let outcome = outcomes
+            .recv_timeout(Duration::from_secs(5))
+            .expect("a completion within the deadline, not a hang");
+        assert!(outcome.is_err(), "a dead peer must fail, got {outcome:?}");
     }
 
     /// A hello inserts the peer with no transfer in sight, and asking again for the same address
