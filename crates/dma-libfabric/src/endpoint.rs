@@ -22,7 +22,7 @@ use crate::connection::LibfabricConnection;
 use crate::error::{check, fabric_error};
 use crate::local_regions::{LocalOperand, LocalRegions};
 use crate::operands::CacheableSpan;
-use crate::peer_addresses::{PeerAddresses, RegisteredAddress};
+use crate::peer_addresses::{AddressFormat, PeerAddresses, RegisteredAddress};
 
 /// Guard a completion's `op_context` before the caller reclaims it as an owned allocation. A
 /// provider reporting a completion for an op we never posted would otherwise be boxed from null.
@@ -170,7 +170,7 @@ impl LibfabricEndpoint {
             uses_virtual_addressing: false,
             max_tx: 0,
             local_regions: LocalRegions::new(ptr::null_mut()),
-            peer_addresses: PeerAddresses::new(ptr::null_mut()),
+            peer_addresses: PeerAddresses::new(ptr::null_mut(), AddressFormat::Opaque),
         };
 
         let list = query_info(configuration, source_node)?;
@@ -231,7 +231,10 @@ impl LibfabricEndpoint {
                 ),
                 "fi_av_open",
             )?;
-            endpoint.peer_addresses = PeerAddresses::new(endpoint.address_vector);
+            endpoint.peer_addresses = PeerAddresses::new(
+                endpoint.address_vector,
+                AddressFormat::from_fi((*endpoint.info).addr_format),
+            );
 
             let mut cq_attr: fi_cq_attr = std::mem::zeroed();
             cq_attr.format = fi_cq_format_FI_CQ_FORMAT_CONTEXT;
