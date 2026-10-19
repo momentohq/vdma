@@ -7,13 +7,13 @@ use std::ptr;
 use std::sync::Arc;
 
 use crate::sys::{
-    FI_CONTEXT2, FI_EAGAIN, FI_EAVAIL, FI_MR_ALLOCATED, FI_MR_ENDPOINT, FI_MR_HMEM, FI_MR_LOCAL,
-    FI_MR_PROV_KEY, FI_MR_VIRT_ADDR, FI_MSG, FI_READ, FI_RECV, FI_REMOTE_READ, FI_REMOTE_WRITE,
-    FI_RMA, FI_SOURCE, FI_TRANSMIT, FI_WRITE, fi_allocinfo, fi_av_attr, fi_av_open,
-    fi_av_type_FI_AV_MAP, fi_cq_attr, fi_cq_entry, fi_cq_err_entry,
-    fi_cq_format_FI_CQ_FORMAT_CONTEXT, fi_cq_open, fi_cq_read, fi_cq_readerr, fi_domain,
-    fi_dupinfo, fi_enable, fi_endpoint, fi_ep_bind, fi_ep_type_FI_EP_RDM, fi_fabric, fi_freeinfo,
-    fi_getinfo, fi_getname, fi_info, fi_version, fid_av, fid_cq, fid_domain, fid_ep, fid_fabric,
+    FI_EAGAIN, FI_EAVAIL, FI_MR_ALLOCATED, FI_MR_ENDPOINT, FI_MR_HMEM, FI_MR_LOCAL, FI_MR_PROV_KEY,
+    FI_MR_VIRT_ADDR, FI_MSG, FI_READ, FI_RECV, FI_REMOTE_READ, FI_REMOTE_WRITE, FI_RMA, FI_SOURCE,
+    FI_TRANSMIT, FI_WRITE, fi_allocinfo, fi_av_attr, fi_av_open, fi_av_type_FI_AV_MAP, fi_cq_attr,
+    fi_cq_entry, fi_cq_err_entry, fi_cq_format_FI_CQ_FORMAT_CONTEXT, fi_cq_open, fi_cq_read,
+    fi_cq_readerr, fi_domain, fi_dupinfo, fi_enable, fi_endpoint, fi_ep_bind, fi_ep_type_FI_EP_RDM,
+    fi_fabric, fi_freeinfo, fi_getinfo, fi_getname, fi_info, fi_version, fid_av, fid_cq,
+    fid_domain, fid_ep, fid_fabric,
 };
 use dma_libfabric_protocol::DmaError;
 
@@ -109,11 +109,8 @@ pub(crate) fn query_info(
         if let Some(name) = &fabric_name {
             (*(*hints).fabric_attr).name = name.as_ptr().cast_mut();
         }
-        // efa-direct mandates FI_CONTEXT2: each op's op_context must be a provider-owned
-        // `fi_context2`. `InFlight` satisfies this by making one its first field.
-        if primary.requires_context2() {
-            (*hints).mode |= FI_CONTEXT2;
-        }
+        // `InFlight` satisfies FI_CONTEXT2 by making a `fi_context2` its first field.
+        (*hints).mode |= primary.required_mode();
         // Leave progress unspecified so EFA uses its native FI_PROGRESS_AUTO.
 
         let (node_ptr, flags) = match &node {

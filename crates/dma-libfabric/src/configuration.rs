@@ -2,6 +2,8 @@
 
 use std::time::Duration;
 
+use crate::sys::{FI_CONTEXT2, FI_RX_CQ_DATA};
+
 /// Supported libfabric providers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -34,10 +36,15 @@ impl Provider {
         }
     }
 
-    /// Whether the endpoint requires `FI_CONTEXT2` mode: a provider-owned `fi_context2` as each op's
-    /// `op_context`.
-    pub fn requires_context2(self) -> bool {
-        matches!(self, Provider::EfaDirect)
+    /// The `fi_info.mode` bits the provider mandates; `fi_getinfo` skips a fabric whose required
+    /// mode the hints don't accept. efa-direct needs `FI_CONTEXT2`, a provider-owned `fi_context2`
+    /// as each op's `op_context`, and to support rdma-core versions before 52, `FI_RX_CQ_DATA`.
+    /// Remote CQ data is not applicable to dma-libfabric, but the support declaration is required.
+    pub fn required_mode(self) -> u64 {
+        match self {
+            Provider::Tcp => 0,
+            Provider::EfaDirect => FI_CONTEXT2 | FI_RX_CQ_DATA,
+        }
     }
 }
 
