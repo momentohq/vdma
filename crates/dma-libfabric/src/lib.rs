@@ -22,8 +22,7 @@ mod region_cache;
 mod reply;
 mod server;
 mod server_dma_worker;
-#[doc(hidden)]
-pub mod sys;
+mod sys;
 
 pub use configuration::{Configuration, Provider};
 pub use devices::discover_domains;

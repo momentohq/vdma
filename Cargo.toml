@@ -21,7 +21,9 @@ dma-libfabric-protocol = { path = "crates/dma-libfabric-protocol" }
 
 # External
 crc-fast               = { version = "1.10", default-features = false, features = ["std"] }
+libc                   = { version = "0.2" }
 linkme                 = { version = "0.3" }
+ofi-libfabric-sys      = { version = "0.2" }
 serde                  = { version = "1", features = ["derive"] }
 thiserror              = { version = "2" }
 tokio                  = { version = "1", features = ["io-std", "io-util", "macros", "net", "rt", "rt-multi-thread", "time"] }

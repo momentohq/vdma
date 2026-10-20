@@ -3,8 +3,10 @@
 use std::marker::PhantomData;
 use std::os::raw::c_void;
 
+use libc::iovec;
+
 use crate::sys::{
-    FI_DELIVERY_COMPLETE, fi_addr_t, fi_msg_rma, fi_read, fi_rma_iov, fi_writemsg, fid_ep, iovec,
+    FI_DELIVERY_COMPLETE, fi_addr_t, fi_msg_rma, fi_read, fi_rma_iov, fi_writemsg, fid_ep,
 };
 
 /// A connection to a peer's exposed buffer, borrowing the endpoint that owns the fabric resources.
