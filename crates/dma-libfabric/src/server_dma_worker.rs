@@ -376,8 +376,8 @@ fn finish_op(
 /// Drop one op from the device-wide tally `submit` raised.
 fn release_outstanding(outstanding: &AtomicUsize) {
     // gotta saturate so it never sees a spurious wrap state
-    let _ = outstanding.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
-        Some(current.saturating_sub(1))
+    outstanding.update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+        current.saturating_sub(1)
     });
 }
 

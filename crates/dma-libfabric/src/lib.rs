@@ -6,6 +6,7 @@
 //! passive targets and live outside this crate.
 //!
 //! [`asynchronous`] is the same server with futures in place of a completion hook.
+#![warn(missing_docs)]
 
 pub mod asynchronous;
 mod configuration;

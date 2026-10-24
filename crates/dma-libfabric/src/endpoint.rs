@@ -445,11 +445,17 @@ impl LibfabricEndpoint {
 /// A diagnostic snapshot of the libfabric provider an endpoint selected.
 #[derive(Debug, Clone)]
 pub struct EndpointInfo {
+    /// `fi_fabric_attr.prov_name`, empty if the provider reported none.
     pub provider: String,
+    /// `fi_info.addr_format`, the `FI_ADDR_*` format of the endpoint's addresses.
     pub addr_format: u32,
+    /// `fi_domain_attr.mr_mode`, the `FI_MR_*` registration bits the provider requires.
     pub mr_mode: u32,
+    /// `fi_info.caps`, the capability bits the provider granted.
     pub caps: u64,
+    /// `FI_MR_LOCAL`: local operands must be registered, so they go through the region cache.
     pub requires_local_mr: bool,
+    /// `FI_MR_VIRT_ADDR`: a peer's remote address is its buffer's virtual address, not an offset.
     pub uses_virtual_addressing: bool,
 }
 

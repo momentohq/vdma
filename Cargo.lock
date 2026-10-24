@@ -1442,6 +1442,7 @@ checksum = "8ecb6da28b8a351d773b68d5825ac39017e680750f980f3a1a85cd8dd28a47c1"
 [[package]]
 name = "valkey-module"
 version = "0.1.11"
+source = "git+https://github.com/kvcache/valkeymodule-rs?rev=996534adab23b6c5ddeef80b7b6313cf0e4df37b#996534adab23b6c5ddeef80b7b6313cf0e4df37b"
 dependencies = [
  "backtrace",
  "bindgen 0.70.1",
@@ -1464,6 +1465,7 @@ dependencies = [
 [[package]]
 name = "valkey-module-macros"
 version = "0.1.11"
+source = "git+https://github.com/kvcache/valkeymodule-rs?rev=996534adab23b6c5ddeef80b7b6313cf0e4df37b#996534adab23b6c5ddeef80b7b6313cf0e4df37b"
 dependencies = [
  "proc-macro2",
  "quote 1.0.47",
@@ -1475,6 +1477,7 @@ dependencies = [
 [[package]]
 name = "valkey-module-macros-internals"
 version = "0.1.11"
+source = "git+https://github.com/kvcache/valkeymodule-rs?rev=996534adab23b6c5ddeef80b7b6313cf0e4df37b#996534adab23b6c5ddeef80b7b6313cf0e4df37b"
 dependencies = [
  "lazy_static",
  "proc-macro2",

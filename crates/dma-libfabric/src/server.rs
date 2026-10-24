@@ -29,23 +29,29 @@ pub enum Direction {
     ToPeer,
     /// `fi_read` peer to local: the `dma.set` path, putting `length` bytes in
     /// [`Operands::allocate`]. The peer's advertisement says how many bytes there are to read.
-    FromPeer { length: usize },
+    FromPeer {
+        /// Transfer reads this many bytes from the peer.
+        length: usize,
+    },
 }
 
-/// The result of a completed transfer: bytes moved, plus the CRC32 when one was requested.
+/// The result of a completed transfer
 #[derive(Debug, Clone, Copy)]
 pub struct TransferDone {
+    /// how many bytes transferred
     pub bytes: usize,
+    /// CRC32C, if requested
     pub checksum: Option<u32>,
 }
 
 /// The outcome of a transfer the worker hands back.
 pub type Outcome = Result<TransferDone, DmaError>;
 
-/// A finished transfer's caller-supplied context paired with its outcome. `complete_batch` consumes
-/// a whole `Vec` of these under one lock acquisition.
+/// A finished transfer's caller-supplied context paired with its outcome.
 pub struct Completion<T> {
+    /// caller-supplied context
     pub caller_context: T,
+    /// Transfer disposition
     pub outcome: Outcome,
 }
 
@@ -56,12 +62,22 @@ pub type BatchCompleter<T> = Box<dyn Fn(std::vec::Drain<Completion<T>>) + Send +
 /// A submitted transfer: Where the peer's exposed buffer is, which way the bytes go, and a
 /// `caller_context` that supplies the local operand and is handed back when the RMA finishes.
 pub struct TransferRequest<TContext> {
+    /// Your identifier for the peer. The worker caches its address-vector entry under it until
+    /// [`FabricService::remove_peer`], so use one id per connected client.
     pub client_id: u64,
+    /// The peer's fabric address, from its [`Advertisement`](dma_libfabric_protocol::Advertisement).
+    /// Inserted into the address vector on first use for `client_id`.
     pub peer_address: Vec<u8>,
+    /// The rkey of the peer's exposed buffer.
     pub remote_key: u64,
+    /// The peer's buffer as the provider addresses it: a virtual address under `FI_MR_VIRT_ADDR`
+    /// (efa), otherwise an offset (tcp).
     pub remote_address: u64,
+    /// Which way the bytes go, and for [`Direction::FromPeer`], how many.
     pub direction: Direction,
+    /// Compute a CRC-32c of the payload, off the fabric worker, into [`TransferDone::checksum`].
     pub want_checksum: bool,
+    /// Supplies the local [`Operands`] and comes back to you in the [`Completion`].
     pub caller_context: TContext,
     /// The caller's per-transfer span. A plain `Id`, not a `Span` clone, because `tracing-cache`
     /// closes a span on the first clone's drop — so the worker parents the on-wire span under it

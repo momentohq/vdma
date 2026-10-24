@@ -8,6 +8,7 @@ use crate::sys::{FI_CONTEXT2, FI_RX_CQ_DATA};
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Provider {
+    /// Software RMA over sockets, for development without RDMA hardware.
     Tcp,
     /// The EFA hardware-RDMA path: the `efa` provider's `efa-direct` fabric, which uses device RMA
     /// with no software wire protocol or host progress engine, unlike EFA's rxr path. Requires
@@ -71,8 +72,7 @@ pub struct Configuration {
     #[serde(default)]
     pub crc_pool_threads: Option<usize>,
     /// How long a transfer may sit unpostable at `-FI_EAGAIN`.
-    /// A connecting or dead client will loop with this status.
-    /// [`DEFAULT_PROGRESS_DEADLINE`].
+    /// A connecting or dead client will loop with this status. Defaults to one second.
     #[serde(default = "default_progress_deadline")]
     pub progress_deadline: Duration,
 }

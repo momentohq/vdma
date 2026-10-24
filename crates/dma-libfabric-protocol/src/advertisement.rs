@@ -6,7 +6,9 @@
 /// Where a client's exposed RMA buffer lives, encoded for the wire.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Advertisement {
+    /// The remote network address for RDMA operation
     pub address: Vec<u8>,
+    /// The rkey for the remote memory region
     pub remote_key: u64,
     /// The exposed buffer's virtual address on `FI_MR_VIRT_ADDR` providers like efa, or 0 where
     /// addressing is by offset, like tcp.
@@ -33,10 +35,13 @@ impl Advertisement {
 /// Errors decoding a transport advertisement.
 #[derive(Debug, thiserror::Error)]
 pub enum AdvertisementError {
+    /// Wrong argument count
     #[error("expected: address rkey remote-address")]
     Arity,
+    /// Invalid hex
     #[error("invalid hex in address")]
     Hex,
+    /// Invalid integer
     #[error("invalid integer in advertisement")]
     Integer,
 }
