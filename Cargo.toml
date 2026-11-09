@@ -8,7 +8,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 license = "Apache-2.0"
 publish = false
@@ -21,7 +21,7 @@ categories = ["network-programming"]
 # Local crates
 configuration          = { path = "crates/configuration" }
 dma-libfabric          = { path = "crates/dma-libfabric" }
-dma-libfabric-protocol = { path = "crates/dma-libfabric-protocol", version = "0.1.0" }
+dma-libfabric-protocol = { path = "crates/dma-libfabric-protocol", version = "0.1.1" }
 
 # External
 crc-fast               = { version = "1.10", default-features = false, features = ["std"] }
