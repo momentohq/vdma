@@ -247,7 +247,7 @@ dependencies = [
 
 [[package]]
 name = "configuration"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "dma-libfabric",
  "serde",
@@ -295,7 +295,7 @@ dependencies = [
 
 [[package]]
 name = "dma-libfabric"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "dma-libfabric-protocol",
  "libc",
@@ -307,7 +307,7 @@ dependencies = [
 
 [[package]]
 name = "dma-libfabric-protocol"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "crc-fast",
  "thiserror",
@@ -659,7 +659,7 @@ dependencies = [
 
 [[package]]
 name = "module"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "configuration",
  "dma-libfabric",
