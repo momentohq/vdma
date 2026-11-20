@@ -67,6 +67,12 @@ impl<TContext: Operands> Operands for Awaited<TContext> {
     fn cacheable_span(&self) -> Option<crate::CacheableSpan> {
         self.user.cacheable_span()
     }
+
+    /// Its [`Transfer`] holds the other reference to the cell, so this is the last one when that
+    /// future has been dropped.
+    fn abandoned(&self) -> bool {
+        1 == Arc::strong_count(&self.cell) || self.user.abandoned()
+    }
 }
 
 /// A submitted transfer. Resolves to the outcome and the context you submitted.
@@ -210,5 +216,32 @@ impl<TContext: Operands + Send + 'static> FabricService<TContext> {
     /// Drop a disconnected client's address-vector entry once its transfers drain.
     pub fn remove_peer(&self, client_id: u64) {
         self.inner.remove_peer(client_id);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::{Arc, Mutex};
+
+    use super::{Awaited, Cell, Transfer};
+    use crate::Operands;
+
+    /// The worker asks this before posting, so a dropped future must read as abandoned while its
+    /// op is still queued, and an awaited one must not.
+    #[test]
+    fn dropping_the_transfer_abandons_its_queued_op() {
+        let cell = Arc::new(Mutex::new(Cell {
+            outcome: None,
+            waker: None,
+        }));
+        let awaited = Awaited {
+            user: Vec::<u8>::new(),
+            cell: Arc::clone(&cell),
+        };
+        let transfer = Transfer { cell };
+        assert!(!awaited.abandoned(), "its future is still held");
+
+        drop(transfer);
+        assert!(awaited.abandoned(), "nobody is left to read the outcome");
     }
 }

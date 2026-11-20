@@ -64,6 +64,15 @@ pub trait Operands {
     fn cacheable_span(&self) -> Option<CacheableSpan> {
         None
     }
+
+    /// Whether anybody will ever look at this transfer's completion. The worker checks before
+    /// posting. Return `true` to drop the transfer unposted and fail it.
+    ///
+    /// The default, `false`, posts everything. Answer `true` only when the result truly
+    /// has no reader, since an abandoned transfer is never retried.
+    fn abandoned(&self) -> bool {
+        false
+    }
 }
 
 /// A `Vec<u8>` can be a whole context on its own. It provides its own bytes, and takes a `FromPeer`

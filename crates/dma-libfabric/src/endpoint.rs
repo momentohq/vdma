@@ -20,7 +20,7 @@ use dma_libfabric_protocol::DmaError;
 use crate::configuration::{Configuration, Provider};
 use crate::connection::LibfabricConnection;
 use crate::domain::Domain;
-use crate::error::{check, fabric_error};
+use crate::error::{CompletionFailure, check, fabric_error};
 use crate::local_regions::{LocalOperand, LocalRegions};
 use crate::operands::CacheableSpan;
 use crate::peer_addresses::{AddressFormat, PeerAddresses, RegisteredAddress};
@@ -267,9 +267,9 @@ impl LibfabricEndpoint {
     /// Every appended `op_context` is non-null and came from a posted op — the caller reclaims it as
     /// an owned allocation. A queue-level failure that names no op is returned instead, never
     /// reported as a completion.
-    pub fn reap(
+    pub(crate) fn reap(
         &self,
-        out: &mut Vec<(*mut c_void, Result<(), DmaError>)>,
+        out: &mut Vec<(*mut c_void, Result<(), CompletionFailure>)>,
         max: usize,
     ) -> Result<(), DmaError> {
         const BATCH: usize = 16;
@@ -302,7 +302,7 @@ impl LibfabricEndpoint {
 
     /// Read one error completion, returning the failing op's `op_context` and the error. `Err` when
     /// the entry the queue promised isn't there, since there is then no op to attribute it to.
-    fn read_error(&self) -> Result<(*mut c_void, Result<(), DmaError>), DmaError> {
+    fn read_error(&self) -> Result<(*mut c_void, Result<(), CompletionFailure>), DmaError> {
         let mut entry: fi_cq_err_entry = unsafe { std::mem::zeroed() };
         let read = unsafe { fi_cq_readerr(self.completion_queue, ptr::from_mut(&mut entry), 0) };
         if read <= 0 {
@@ -311,10 +311,7 @@ impl LibfabricEndpoint {
 
         Ok((
             entry.op_context,
-            Err(crate::error::completion_error(
-                self.completion_queue,
-                &entry,
-            )),
+            Err(CompletionFailure::from_entry(self.completion_queue, &entry)),
         ))
     }
 
@@ -350,6 +347,11 @@ impl LibfabricEndpoint {
         peer_address: &[u8],
     ) -> Result<Arc<RegisteredAddress>, DmaError> {
         self.peer_addresses.handle(client_id, peer_address)
+    }
+
+    /// The entry already held for `peer_address`, if any, without inserting it.
+    pub(crate) fn find_peer(&self, peer_address: &[u8]) -> Option<Arc<RegisteredAddress>> {
+        self.peer_addresses.find(peer_address)
     }
 
     /// Let go of a disconnected client's address-vector entry. It leaves the vector only once every

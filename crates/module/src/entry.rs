@@ -21,8 +21,8 @@ valkey_module! {
     commands: [
         ["dma.info", dma_info_command, "readonly", 0, 0, 0],
         ["dma.hello", dma_hello_command, "readonly", 0, 0, 0],
-        ["dma.set", dma_set_command, "write deny-oom", 5, 5, 1],
-        ["dma.get", dma_get_command, "readonly", 5, 5, 1],
+        ["dma.set", dma_set_command, "write deny-oom", 1, 1, 1],
+        ["dma.get", dma_get_command, "readonly", 1, 1, 1],
     ],
     configurations: [
         i64: [],
@@ -173,9 +173,10 @@ fn dma_get_command(context: &Context, args: Vec<ValkeyString>) -> ValkeyResult {
 }
 
 /// The parsed fields of a `DMA.SET` or `DMA.GET`, whose wire layout is
-/// `<command> <address> <rkey> <remote-address> <length> <key> [<crc>]`. The advertisement says
-/// where the client's buffer is. The length is payload bytes for SET and buffer capacity for GET.
-/// The trailing CRC is the checksum to verify on SET, and on GET asks the server to return one.
+/// `<command> <key> <length> <address> <rkey> <remote-address> [<crc>]`.
+/// The advertisement says where the client's buffer is. Length is payload bytes for SET and buffer
+/// capacity for GET. The trailing CRC is the checksum to verify on SET, and on GET asks the server
+/// to return a crc.
 struct DataArgs<'a> {
     advertisement: Advertisement,
     length: usize,
@@ -184,18 +185,18 @@ struct DataArgs<'a> {
 }
 
 fn parse_data_args(args: &[ValkeyString]) -> Result<DataArgs<'_>, ValkeyError> {
-    // `base` counts the args through the key, which is also where a trailing crc would sit.
+    // `base` counts the args through the advertisement, which is also where a trailing crc would sit.
     let base = 3 + Advertisement::ARG_COUNT;
     if args.len() != base && args.len() != base + 1 {
         return Err(ValkeyError::WrongArity);
     }
     let advertisement =
-        Advertisement::from_fields(&[args[1].as_slice(), args[2].as_slice(), args[3].as_slice()])
+        Advertisement::from_fields(&[args[3].as_slice(), args[4].as_slice(), args[5].as_slice()])
             .map_err(command_error)?;
     Ok(DataArgs {
         advertisement,
-        length: parse_length(args[base - 2].as_slice())?,
-        key: &args[base - 1],
+        length: parse_length(args[2].as_slice())?,
+        key: &args[1],
         crc: args.get(base).map(ValkeyString::as_slice),
     })
 }

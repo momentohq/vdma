@@ -11,6 +11,7 @@
 use std::borrow::Borrow;
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, Weak};
 
 use dma_libfabric_protocol::DmaError;
@@ -120,6 +121,23 @@ pub struct RegisteredAddress {
     /// endpoint closes the vector, so this lives for as long as an entry exists.
     address_vector: *mut fid_av,
     peer: fi_addr_t,
+    /// A [`Liveness`]. Only the fabric worker reads or writes it; it's atomic so the entry stays
+    /// `Sync` without leaning on the unsafe impl below.
+    liveness: AtomicU8,
+}
+
+/// What the worker knows about whether a peer answers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub(crate) enum Liveness {
+    /// Inserted, and nothing has been asked of it yet.
+    Unprobed,
+    /// A liveness probe is out, and the peer's transfers wait for it.
+    Probing,
+    /// It answered.
+    Alive,
+    /// It didn't answer, so nothing more is posted to it. Sticks until the entry is released.
+    Dead,
 }
 
 // SAFETY: Only read while live, and the fi_av_remove is safe because of Drop. libfabric
@@ -132,6 +150,20 @@ impl RegisteredAddress {
     pub fn handle(&self) -> fi_addr_t {
         self.peer
     }
+
+    pub(crate) fn liveness(&self) -> Liveness {
+        match self.liveness.load(Ordering::Relaxed) {
+            0 => Liveness::Unprobed,
+            1 => Liveness::Probing,
+            2 => Liveness::Alive,
+            3 => Liveness::Dead,
+            _ => unreachable!("this is set by set_liveness with a closed enum"),
+        }
+    }
+
+    pub(crate) fn set_liveness(&self, liveness: Liveness) {
+        self.liveness.store(liveness as u8, Ordering::Relaxed);
+    }
 }
 
 impl std::fmt::Debug for RegisteredAddress {
@@ -139,6 +171,7 @@ impl std::fmt::Debug for RegisteredAddress {
         formatter
             .debug_struct("RegisteredAddress")
             .field("peer", &self.peer)
+            .field("liveness", &self.liveness())
             .finish()
     }
 }
@@ -228,11 +261,21 @@ impl PeerAddresses {
         let entry = Arc::new(RegisteredAddress {
             address_vector: self.address_vector,
             peer: self.insert(key.bytes())?,
+            liveness: AtomicU8::new(Liveness::Unprobed as u8),
         });
         self.sweep();
         self.by_address.insert(key, Arc::downgrade(&entry));
         self.by_client.insert(client_id, Arc::clone(&entry));
         Ok(entry)
+    }
+
+    /// The entry already held for exactly `address`, without inserting one.
+    pub(crate) fn find(&self, address: &[u8]) -> Option<Arc<RegisteredAddress>> {
+        let identity = &address[..self.format.identity_len(address).ok()?];
+        let (known, entry) = self.by_address.get_key_value(identity)?;
+        (known.bytes() == address)
+            .then(|| entry.upgrade())
+            .flatten()
     }
 
     /// Let go of `client_id`'s entry. The entry leaves the address vector only if this was the last

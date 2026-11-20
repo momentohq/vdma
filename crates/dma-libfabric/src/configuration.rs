@@ -12,7 +12,7 @@ pub enum Provider {
     Tcp,
     /// The EFA hardware-RDMA path: the `efa` provider's `efa-direct` fabric, which uses device RMA
     /// with no software wire protocol or host progress engine, unlike EFA's rxr path. Requires
-    /// `FI_CONTEXT2` — see `server_dma_worker::InFlight` for how that is satisfied.
+    /// `FI_CONTEXT2` — see `server_dma_worker::OpHeader` for how that is satisfied.
     #[serde(rename = "efa-direct")]
     EfaDirect,
 }
@@ -88,6 +88,19 @@ pub struct Configuration {
     /// Off by default.
     #[serde(default)]
     pub quiesce_writes: bool,
+    /// Probe each new peer with a 0-byte read before posting any transfer, and fail fast.
+    ///
+    /// An EFA device holds a dead read for about 190 seconds. It is a network device-wide effect
+    /// that results in the EFA card being unable to transfer anything else until the timeouts expire.
+    /// An EFA will currently hang with somewhere around 60MiB of dead pending command data.
+    /// The liveness probe is 0 bytes, so a trivially dead peer doesn't add up against that limit. Its
+    /// transfers fail early instead of being queued.
+    /// A peer whose transfer later completes as unreachable is failed the same way.
+    ///
+    /// Don't be too aggressive with this timeout (give it a second probably) or you will fail healthy
+    /// peers. Off by default.
+    #[serde(default)]
+    pub liveness_probe: Option<Duration>,
 }
 
 fn default_progress_deadline() -> Duration {
@@ -104,6 +117,7 @@ impl Default for Configuration {
             crc_pool_threads: None,
             progress_deadline: default_progress_deadline(),
             quiesce_writes: false,
+            liveness_probe: None,
         }
     }
 }
