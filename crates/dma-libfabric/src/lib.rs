@@ -20,6 +20,7 @@ mod memory_region;
 mod operands;
 mod peer_addresses;
 mod pool;
+mod probe;
 mod region_cache;
 mod reply;
 mod server;

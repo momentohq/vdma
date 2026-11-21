@@ -49,11 +49,11 @@ it according to the control channel's instructions.
 * `DMA.HELLO`: Server returns an array of (hex) fabric addresses, one per efa worker — the
   set of source addresses it may initiate from. The client inserts all of them into its
   address vector before any RMA, since any of them may be the initiator for a given transfer.
-* `DMA.SET <address> <rkey> <remote-address> <length> <key> [<crc>]`: Client advertises
+* `DMA.SET <key> <length> <address> <rkey> <remote-address> [<crc>]`: Client advertises
   a registered buffer (endpoint address, remote key, buffer virtual address) with a value.
   Server sizes the ValkeyString and dma-reads the payload straight into it. If requested,
   it verifies `<crc>` (mismatch aborts the write), and replies `<n_bytes>` over RESP.
-* `DMA.GET <address> <rkey> <remote-address> <capacity> <key> [<crc-flag>]`: Client
+* `DMA.GET <key> <capacity> <address> <rkey> <remote-address> [<crc-flag>]`: Client
   advertises a registered buffer and capacity. Server dma-writes the value into it (nil
   if absent, error if the value is larger than `capacity`). Replies `<n_bytes> [<crc>]`
   over RESP. Client verifies checksum if requested.

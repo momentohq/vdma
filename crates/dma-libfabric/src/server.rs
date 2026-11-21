@@ -356,6 +356,114 @@ mod tests {
         assert!(outcome.is_err(), "a dead peer must fail, got {outcome:?}");
     }
 
+    /// A tcp peer that answers: tcp needs the target to drive progress, which an EFA target does
+    /// in hardware. Polls until the returned flag is set.
+    fn answering_peer() -> (Vec<u8>, Arc<std::sync::atomic::AtomicBool>) {
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let stopping = Arc::clone(&stop);
+        let (report, address) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let configuration = Configuration {
+                providers: vec![Provider::Tcp],
+                bind: Some("127.0.0.1".to_string()),
+                ..Configuration::default()
+            };
+            let endpoint =
+                crate::endpoint::LibfabricEndpoint::open(&configuration, Some("127.0.0.1"))
+                    .expect("tcp endpoint");
+            report
+                .send(endpoint.local_address().expect("local address"))
+                .expect("test is waiting");
+            let mut reaped = Vec::new();
+            while !stopping.load(std::sync::atomic::Ordering::Relaxed) {
+                let _ = endpoint.reap(&mut reaped, 16);
+                std::thread::yield_now();
+            }
+        });
+        (address.recv().expect("peer address"), stop)
+    }
+
+    /// The address of a tcp endpoint that has closed, so nothing answers there.
+    fn closed_peer() -> Vec<u8> {
+        server().local_address().to_vec()
+    }
+
+    /// A tcp server probing new peers with `deadline`, reporting each outcome on the receiver.
+    fn probing_server(
+        deadline: Duration,
+    ) -> (
+        FabricService<Vec<u8>>,
+        std::sync::mpsc::Receiver<super::Outcome>,
+    ) {
+        let configuration = Configuration {
+            providers: vec![Provider::Tcp],
+            bind: Some("127.0.0.1".to_string()),
+            // Long, so only the probe can be what fails a dead peer here.
+            progress_deadline: Duration::from_secs(30),
+            liveness_probe: Some(deadline),
+            ..Configuration::default()
+        };
+        let pool = Arc::new(Pool::new(1).expect("pool"));
+        let (report, outcomes) = std::sync::mpsc::channel();
+        let complete = Box::new(move |batch: std::vec::Drain<'_, Completion<Vec<u8>>>| {
+            for completion in batch {
+                let _ = report.send(completion.outcome);
+            }
+        });
+        let server = FabricService::start(&configuration, complete, pool).expect("tcp server");
+        (server, outcomes)
+    }
+
+    /// A peer that answers passes its probe, whatever the probe's own read made of key 0.
+    #[test]
+    fn a_hello_to_a_live_peer_passes_its_probe() {
+        let (server, _outcomes) = probing_server(Duration::from_secs(5));
+        let (peer, stop) = answering_peer();
+        let answer = server.add_peer(1, &peer);
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        answer.expect("a live peer answers the probe");
+    }
+
+    /// The hello is where an unreachable client should find out, before it sends a transfer.
+    #[test]
+    fn a_hello_to_a_dead_peer_fails_at_the_probe_deadline() {
+        let (server, _outcomes) = probing_server(Duration::from_millis(50));
+        let error = server
+            .add_peer(1, &closed_peer())
+            .expect_err("nothing answers a closed endpoint");
+        assert!(
+            error.to_string().contains("liveness probe"),
+            "the probe failed it, got {error}"
+        );
+    }
+
+    /// A transfer to a peer that never answers fails on the probe, never posted, rather than at
+    /// the much longer progress deadline.
+    #[test]
+    fn a_transfer_to_a_dead_peer_fails_on_its_probe() {
+        let (server, outcomes) = probing_server(Duration::from_millis(50));
+        let request = TransferRequest {
+            client_id: 1,
+            peer_address: closed_peer(),
+            remote_key: 0,
+            remote_address: 0,
+            direction: Direction::ToPeer,
+            want_checksum: false,
+            caller_context: vec![0xab; 64],
+            parent_id: None,
+        };
+        assert!(server.submit(request).is_ok());
+
+        let outcome = outcomes
+            .recv_timeout(Duration::from_secs(5))
+            .expect("a completion well inside the progress deadline");
+        let error = outcome.expect_err("a dead peer must fail");
+        assert!(
+            error.to_string().contains("liveness probe"),
+            "the probe failed it, got {error}"
+        );
+    }
+
     /// A hello inserts the peer with no transfer in sight, and asking again for the same address
     /// shares the entry rather than failing or duplicating it.
     #[test]
